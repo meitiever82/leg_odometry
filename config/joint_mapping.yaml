@@ -1,0 +1,77 @@
+# CASBot02 关节映射表
+# bag 关节名 -> URDF 关节名
+# 如果映射有误，只需改这个文件，不用改代码
+
+joint_mapping:
+  # === 左腿 ===
+  LJ0: left_leg_pelvic_pitch_joint
+  LJ1: left_leg_pelvic_roll_joint
+  LJ2: left_leg_pelvic_yaw_joint
+  LJ3: left_leg_knee_pitch_joint
+  LJPITCH: left_leg_ankle_pitch_joint
+  LJROLL: left_leg_ankle_roll_joint
+  # === 右腿 ===
+  RJ6: right_leg_pelvic_pitch_joint
+  RJ7: right_leg_pelvic_roll_joint
+  RJ8: right_leg_pelvic_yaw_joint
+  RJ9: right_leg_knee_pitch_joint
+  RJPITCH: right_leg_ankle_pitch_joint
+  RJROLL: right_leg_ankle_roll_joint
+  # === 腰部 ===
+  waist_yaw: waist_yaw_joint
+  # === 头部 ===
+  head_yaw: head_yaw_joint
+  head_pitch: head_pitch_joint
+  # === 左臂 ===
+  left_shoulder_pitch: left_shoulder_pitch_joint
+  left_shoulder_roll: left_shoulder_roll_joint
+  left_shoulder_yaw: left_shoulder_yaw_joint
+  left_elbow_pitch: left_elbow_pitch_joint
+  left_wrist_yaw: left_wrist_yaw_joint
+  left_wrist_pitch: left_wrist_pitch_joint
+  left_wrist_roll: left_wrist_roll_joint
+  # === 右臂 ===
+  right_shoulder_pitch: right_shoulder_pitch_joint
+  right_shoulder_roll: right_shoulder_roll_joint
+  right_shoulder_yaw: right_shoulder_yaw_joint
+  right_elbow_pitch: right_elbow_pitch_joint
+  right_wrist_yaw: right_wrist_yaw_joint
+  right_wrist_pitch: right_wrist_pitch_joint
+  right_wrist_roll: right_wrist_roll_joint
+
+# 忽略的关节（并联连杆电机，不在 URDF 中）
+ignored_joints:
+  - LJUP
+  - LJDOWN
+  - RJUP
+  - RJDOWN
+
+# 关节符号修正（发现方向反了改成 -1.0）
+joint_sign:
+  LJ0: 1.0
+  LJ1: 1.0
+  LJ2: 1.0
+  LJ3: 1.0
+  LJPITCH: 1.0
+  LJROLL: 1.0
+  RJ6: 1.0
+  RJ7: 1.0
+  RJ8: 1.0
+  RJ9: 1.0
+  RJPITCH: 1.0
+  RJROLL: 1.0
+
+# 关节零位偏移修正（单位 rad）
+joint_offset:
+  LJ0: 0.0
+  LJ1: 0.0
+  LJ2: 0.0
+  LJ3: 0.0
+  LJPITCH: 0.0
+  LJROLL: 0.0
+  RJ6: 0.0
+  RJ7: 0.0
+  RJ8: 0.0
+  RJ9: 0.0
+  RJPITCH: 0.0
+  RJROLL: 0.0

@@ -1,0 +1,48 @@
+# Bloesch EKF 参数
+
+ekf:
+  # 重力 (m/s^2)
+  gravity: [0.0, 0.0, -9.81]
+
+  # IMU 噪声参数
+  accel_noise: 0.1            # m/s^2
+  gyro_noise: 0.01            # rad/s
+  accel_bias_walk: 0.0        # m/s^2/sqrt(s) (暂保持锁定，需要更仔细的调参)
+  gyro_bias_walk: 0.001       # rad/s/sqrt(s)
+
+  # 足端位置过程噪声
+  foot_contact_noise: 0.002   # m/sqrt(s)  着地时
+  foot_swing_noise: 1.0       # m/sqrt(s)  腾空时
+
+  # FK 观测噪声
+  fk_position_noise: 0.005    # m
+
+  # ZUPT 速度约束噪声 (接触脚世界速度 ≈ 0)
+  zupt_noise: 0.03            # m/s
+
+  # 平面运动约束 (机器人在平地行走, Z 方向几乎不动)
+  flat_vz_noise: 0.01         # m/s, Z 速度 ≈ 0
+  flat_z_noise: 0.01          # m, Z 位置 ≈ 初始高度
+
+  # 初始协方差
+  init_pos_std: 0.01          # m
+  init_vel_std: 0.01          # m/s
+  init_rot_std: 0.01          # rad
+  init_accel_bias_std: 0.0    # m/s^2 (锁定)
+  init_gyro_bias_std: 0.0     # rad/s (锁定)
+  init_foot_std: 0.01         # m
+
+contact:
+  # 接触检测参数
+  effort_threshold: 5.0       # Nm, 踝关节力矩阈值
+  hysteresis: 1.0             # Nm, 滞后量 (上阈值=threshold+hyst, 下阈值=threshold-hyst)
+  effort_joint_left: LJPITCH  # 左脚接触检测用的关节
+  effort_joint_right: RJPITCH # 右脚接触检测用的关节
+
+kinematics:
+  # URDF 路径
+  urdf_path: ""               # 空则从 /robot_description 参数获取
+  # 足端 link 名
+  left_foot_link: left_leg_ankle_roll_link
+  right_foot_link: right_leg_ankle_roll_link
+  base_link: base_link
