@@ -8,10 +8,11 @@ ESKF + GTSAM Hybrid 腿式里程计，用于 CASBot02 人形机器人。
 /imu (200Hz) ──► ESKF 前端 (C++)          ──► /leg_odometry
 /joint_states ──►  ├── IMU 递推                (Odometry, 200Hz)
                    ├── FK 位置观测
-                   ├── ZUPT 速度约束
+                   ├── ZUPT 速度约束（分轴噪声）
                    ├── 步级速度估计
-                   ├── 静止检测
-                   └── 平面 Z 约束
+                   ├── 静止检测（gyro 方差）
+                   ├── 平面 Z 约束
+                   └── 接触检测（effort + FK Z 辅助）
                         │
                    ┌────▼──────────┐
                    │ GTSAM Smoother│ ← 每 20 关键帧一次
@@ -27,9 +28,9 @@ ESKF + GTSAM Hybrid 腿式里程计，用于 CASBot02 人形机器人。
 |------|------|---------|--------|
 | slope_up_down | 12m | **2.2%** | 32cm |
 | turn_in_place | 1.7m | **1.8%** | 1cm |
-| straight_medium (0.5m/s) | 15m | **5.1%** | 4cm |
-| s_curve | 26m | **7.5%** | 4cm |
-| straight_fast (0.8m/s) | 20m | **11.7%** | 5cm |
+| straight_medium (0.5m/s) | 15m | **1.8%** (Py) / **5.0%** (C++) | 4cm |
+| s_curve | 26m | **7.3%** | 4cm |
+| straight_fast (0.8m/s) | 20m | **13.9%** | 5cm |
 | straight_slow (0.3m/s) | 9m | **17.4%** | 3cm |
 | stop_and_go | 14m | 39.4% | 4cm |
 | long_walk (5min) | 142m | 42.6% | 3cm |

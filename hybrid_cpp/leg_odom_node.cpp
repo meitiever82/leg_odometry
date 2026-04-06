@@ -152,11 +152,20 @@ class LegOdomNode : public rclcpp::Node {
                          msg->angular_velocity.z);
     auto stamp = msg->header.stamp;
 
-    // Initialization
+    // Initialization（方差检测确认静止）
     if (!state_.initialized) {
       init_accel_sum_ += accel;
+      init_gyro_buf_.push_back(gyro.norm());
       init_count_++;
       if (init_count_ >= init_frames_ && !latest_joints_.empty()) {
+        // 检查 gyro 方差确认静止
+        double sum = 0, sum2 = 0;
+        int n = init_gyro_buf_.size();
+        for (auto v : init_gyro_buf_) { sum += v; sum2 += v * v; }
+        double gyro_std = std::sqrt(sum2 / n - (sum / n) * (sum / n));
+        if (gyro_std > 0.05) {
+          return;  // 还在动，继续等
+        }
         Eigen::Vector3d avg = init_accel_sum_ / init_count_;
         auto fl = kin_.fk_left(latest_joints_);
         auto fr = kin_.fk_right(latest_joints_);
@@ -166,7 +175,7 @@ class LegOdomNode : public rclcpp::Node {
           current_bias_ = gtsam::imuBias::ConstantBias(state_.b_a, state_.b_g);
           pim_ = smoother_->create_preintegrator(current_bias_);
         }
-        RCLCPP_INFO(get_logger(), "ESKF initialized from %d IMU frames", init_count_);
+        RCLCPP_INFO(get_logger(), "ESKF initialized from %d IMU frames (gyro_std=%.4f)", init_count_, gyro_std);
       }
       return;
     }
@@ -279,6 +288,7 @@ class LegOdomNode : public rclcpp::Node {
 
   // Initialization
   Eigen::Vector3d init_accel_sum_ = Eigen::Vector3d::Zero();
+  std::vector<double> init_gyro_buf_;
   int init_count_ = 0;
   int init_frames_ = 50;
   double last_imu_time_ = -1;

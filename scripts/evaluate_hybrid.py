@@ -60,10 +60,14 @@ def run_hybrid_offline(bag_dir: str):
     gt_times, gt_positions, gt_orientations = [], [], []
 
     latest_joints = {}
+    latest_joint_vels = {}
     latest_efforts = {}
     last_imu_ts = None
     init_count = 0
     init_accel_sum = np.zeros(3)
+    init_gyro_sum = np.zeros(3)
+    init_accel_buf = []
+    init_gyro_buf = []
     INIT_FRAMES = 50
 
     # 关键帧预积分器
@@ -93,8 +97,11 @@ def run_hybrid_offline(bag_dir: str):
                 if len(msg.effort) > i:
                     latest_efforts[name] = msg.effort[i]
                 urdf_name = JOINT_MAPPING.get(name)
-                if urdf_name and len(msg.position) > i:
-                    latest_joints[urdf_name] = msg.position[i]
+                if urdf_name:
+                    if len(msg.position) > i:
+                        latest_joints[urdf_name] = msg.position[i]
+                    if len(msg.velocity) > i:
+                        latest_joint_vels[urdf_name] = msg.velocity[i]
             continue
 
         if topic == '/imu':
@@ -109,11 +116,20 @@ def run_hybrid_offline(bag_dir: str):
                 msg.angular_velocity.z,
             ])
 
-            # 初始化
+            # 初始化（方差检测确认静止）
             if not ekf.initialized:
                 init_accel_sum += accel
+                init_gyro_sum += gyro
+                init_accel_buf.append(accel.copy())
+                init_gyro_buf.append(gyro.copy())
                 init_count += 1
                 if init_count >= INIT_FRAMES and latest_joints:
+                    # 检查是否真正静止：gyro 方差小
+                    gyro_arr = np.array(init_gyro_buf[-INIT_FRAMES:])
+                    gyro_std = np.std(np.linalg.norm(gyro_arr, axis=1))
+                    if gyro_std > 0.05:
+                        # 还在动，继续等
+                        continue
                     avg_accel = init_accel_sum / init_count
                     p_fl = kinematics.fk_left(latest_joints)
                     p_fr = kinematics.fk_right(latest_joints)
@@ -145,6 +161,9 @@ def run_hybrid_offline(bag_dir: str):
             if latest_joints:
                 p_fl = kinematics.fk_left(latest_joints)
                 p_fr = kinematics.fk_right(latest_joints)
+
+                # 关节速度 Jacobian 方式在真实数据上因编码器噪声放大反而更差
+                # 保持有限差分 dFK/dt（天然低通滤波）
                 ekf.update(p_fl, p_fr, contact_l, contact_r)
 
             # 记录 ESKF 输出

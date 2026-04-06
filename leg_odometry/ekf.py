@@ -249,21 +249,20 @@ class BloeSchEKF:
             self.P_cov[self.BG, :] = 0; self.P_cov[:, self.BG] = 0
 
     def update(self, p_fl_body: np.ndarray, p_fr_body: np.ndarray,
-               contact_left: bool = True, contact_right: bool = True):
+               contact_left: bool = True, contact_right: bool = True,
+               v_fl_body: np.ndarray = None, v_fr_body: np.ndarray = None):
         """EKF 更新步骤: 运动学位置观测 + 接触脚 ZUPT 速度约束。
 
         位置观测: h_pos = p + R·FK(q) - p_foot = 0
-        ZUPT:     h_vel = v + [ω]×(R·FK) ≈ 0  (接触脚世界速度为零)
-
-        简化 ZUPT: 忽略关节速度 R·J·q̇ 和角速度 [ω]×(R·FK) 项,
-        直接约束 d(p_foot)/dt ≈ 0 ⟹ v ≈ R·J·q̇ - [ω]×(R·FK)
-        近似为 v_foot = v + [ω]×(R·FK) ≈ 0
+        ZUPT:     v + [ω]×(R·FK) + R·J·q̇ ≈ 0  (接触脚世界速度为零)
 
         Args:
             p_fl_body: 左脚在 body 系中的位置 (FK)
             p_fr_body: 右脚在 body 系中的位置 (FK)
             contact_left: 左脚是否着地
             contact_right: 右脚是否着地
+            v_fl_body: 左脚在 body 系中的线速度 J·q̇ (可选，None 则用有限差分)
+            v_fr_body: 右脚在 body 系中的线速度 J·q̇ (可选)
         """
         if not self.initialized:
             return
@@ -284,7 +283,7 @@ class BloeSchEKF:
 
         # 左脚 ZUPT（仅接触时）
         if contact_left and self._prev_fk_left is not None:
-            self._zupt_update(p_fl_body, self._prev_fk_left, R_zupt)
+            self._zupt_update(p_fl_body, self._prev_fk_left, R_zupt, v_fl_body)
         self._prev_fk_left = p_fl_body.copy()
 
         # 左脚步级速度: 支撑相开始/结束时记录 FK
@@ -324,7 +323,7 @@ class BloeSchEKF:
 
         # 右脚 ZUPT（仅接触时）
         if contact_right and self._prev_fk_right is not None:
-            self._zupt_update(p_fr_body, self._prev_fk_right, R_zupt)
+            self._zupt_update(p_fr_body, self._prev_fk_right, R_zupt, v_fr_body)
         self._prev_fk_right = p_fr_body.copy()
 
         # 右脚足端预积分
@@ -390,20 +389,25 @@ class BloeSchEKF:
                 np.array([[self.sigma_flat_z**2]]))
 
     def _zupt_update(self, fk_now: np.ndarray, fk_prev: np.ndarray,
-                     R_zupt: np.ndarray):
+                     R_zupt: np.ndarray, foot_vel_body: np.ndarray = None):
         """零速度更新: 接触脚世界速度为零 → 约束 body 速度。
 
         接触时足端固定: d/dt(p + R·FK) = 0
-        展开: v + [ω_w]×(R·FK) + R·dFK/dt = 0
-        因此: v = -[ω_w]×(R·FK) - R·dFK/dt
+        展开: v + [ω_w]×(R·FK) + R·(J·q̇) = 0
+
+        使用分轴噪声: XY 方向更紧（水平速度约束更强），
+        Z 方向由 FlatZ 约束管理，这里放松。
         """
         dt = self._last_dt
         if dt <= 1e-6 or dt > 0.1:
             return
 
-        # R·dFK/dt (有限差分，用固定 dt 避免浮点精度问题)
-        dt_fk = 0.005  # FK 采样间隔
-        R_dfk = self.R @ ((fk_now - fk_prev) / dt_fk)
+        # R·(dFK/dt): 优先用 Jacobian 精确计算，否则有限差分
+        if foot_vel_body is not None:
+            R_dfk = self.R @ foot_vel_body
+        else:
+            dt_fk = 0.005
+            R_dfk = self.R @ ((fk_now - fk_prev) / dt_fk)
 
         # [ω_world]×(R·FK)
         r_world = self.R @ fk_now
@@ -417,7 +421,11 @@ class BloeSchEKF:
         H = np.zeros((3, self.DIM))
         H[:, self.V] = np.eye(3)
 
-        self._kalman_update(residual, H, R_zupt)
+        # 分轴噪声: XY 更紧，Z 由 FlatZ 管
+        R_zupt_diag = R_zupt.copy()
+        R_zupt_diag[2, 2] *= 4.0  # Z 方向放松 2x（已有 FlatZ）
+
+        self._kalman_update(residual, H, R_zupt_diag)
 
     def _kalman_update(self, residual: np.ndarray, H: np.ndarray,
                        R: np.ndarray):

@@ -87,10 +87,12 @@ class LegKinematics:
         # 左腿链
         self._chain_left = tree.getChain(base_link, left_foot_link)
         self._fk_left = PyKDL.ChainFkSolverPos_recursive(self._chain_left)
+        self._jac_left = PyKDL.ChainJntToJacSolver(self._chain_left)
 
         # 右腿链
         self._chain_right = tree.getChain(base_link, right_foot_link)
         self._fk_right = PyKDL.ChainFkSolverPos_recursive(self._chain_right)
+        self._jac_right = PyKDL.ChainJntToJacSolver(self._chain_right)
 
         # 提取链中关节名（按 KDL 顺序）
         self.left_joint_names = self._get_joint_names(self._chain_left)
@@ -128,6 +130,44 @@ class LegKinematics:
         fk_solver.JntToCart(q, frame)
         p = frame.p
         return np.array([p.x(), p.y(), p.z()])
+
+    def foot_velocity_left(self, joint_positions: dict[str, float],
+                           joint_velocities: dict[str, float]) -> np.ndarray:
+        """计算左脚在 body 系中的线速度 J·q̇ [x, y, z]。"""
+        return self._compute_foot_vel(
+            self._chain_left, self._jac_left,
+            self.left_joint_names, joint_positions, joint_velocities)
+
+    def foot_velocity_right(self, joint_positions: dict[str, float],
+                            joint_velocities: dict[str, float]) -> np.ndarray:
+        """计算右脚在 body 系中的线速度 J·q̇ [x, y, z]。"""
+        return self._compute_foot_vel(
+            self._chain_right, self._jac_right,
+            self.right_joint_names, joint_positions, joint_velocities)
+
+    @staticmethod
+    def _compute_foot_vel(chain, jac_solver, joint_names,
+                          joint_positions, joint_velocities):
+        n = chain.getNrOfJoints()
+        q = PyKDL.JntArray(n)
+        qdot = PyKDL.JntArray(n)
+        for i, name in enumerate(joint_names):
+            q[i] = joint_positions.get(name, 0.0)
+            qdot[i] = joint_velocities.get(name, 0.0)
+
+        jac = PyKDL.Jacobian(n)
+        jac_solver.JntToJac(q, jac)
+
+        # J is 6xN (top 3 rows = linear, bottom 3 = angular)
+        # foot_vel = J_linear @ qdot
+        J = np.zeros((6, n))
+        for row in range(6):
+            for col in range(n):
+                J[row, col] = jac[row, col]
+
+        qdot_arr = np.array([qdot[i] for i in range(n)])
+        vel_6d = J @ qdot_arr
+        return vel_6d[:3]  # linear velocity only
 
     def fk_left_frame(self, joint_positions: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
         """计算左脚完整位姿 (position, rotation_matrix)。"""

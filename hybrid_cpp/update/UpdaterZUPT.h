@@ -22,7 +22,9 @@ class UpdaterZUPT {
                      const Eigen::Vector3d& fk_left_body,
                      const Eigen::Vector3d& fk_right_body,
                      bool contact_left, bool contact_right) {
+    // 分轴 ZUPT 噪声: XY 更紧, Z 由 FlatZ 管
     Eigen::Matrix3d R_zupt = Eigen::Matrix3d::Identity() * noise.sigma_zupt * noise.sigma_zupt;
+    R_zupt(2, 2) *= 4.0;  // Z 方向放松
     Eigen::MatrixXd H_v = Eigen::MatrixXd::Zero(3, DIM);
     H_v.block<3,3>(0, V) = Eigen::Matrix3d::Identity();
 

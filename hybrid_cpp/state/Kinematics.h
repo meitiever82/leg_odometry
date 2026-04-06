@@ -16,6 +16,8 @@
 #include <kdl/tree.hpp>
 #include <kdl/chain.hpp>
 #include <kdl/chainfksolverpos_recursive.hpp>
+#include <kdl/chainjnttojacsolver.hpp>
+#include <kdl/jacobian.hpp>
 #include <kdl/frames.hpp>
 #include <kdl/jntarray.hpp>
 #include <kdl_parser/kdl_parser.hpp>
@@ -47,6 +49,8 @@ class LegKinematics {
 
     fk_left_ = std::make_unique<KDL::ChainFkSolverPos_recursive>(chain_left_);
     fk_right_ = std::make_unique<KDL::ChainFkSolverPos_recursive>(chain_right_);
+    jac_left_ = std::make_unique<KDL::ChainJntToJacSolver>(chain_left_);
+    jac_right_ = std::make_unique<KDL::ChainJntToJacSolver>(chain_right_);
 
     // Extract joint names
     left_joint_names_ = get_joint_names(chain_left_);
@@ -62,6 +66,17 @@ class LegKinematics {
 
   Eigen::Vector3d fk_right(const std::map<std::string, double>& joints) const {
     return compute_fk(chain_right_, *fk_right_, right_joint_names_, joints);
+  }
+
+  // 足端速度 J·q̇（可选，默认 ZUPT 用有限差分更稳定）
+  Eigen::Vector3d foot_velocity_left(const std::map<std::string, double>& joints,
+                                      const std::map<std::string, double>& joint_vels) const {
+    return compute_foot_vel(chain_left_, left_joint_names_, joints, joint_vels);
+  }
+
+  Eigen::Vector3d foot_velocity_right(const std::map<std::string, double>& joints,
+                                       const std::map<std::string, double>& joint_vels) const {
+    return compute_foot_vel(chain_right_, right_joint_names_, joints, joint_vels);
   }
 
   const std::vector<std::string>& left_joint_names() const { return left_joint_names_; }
@@ -97,8 +112,37 @@ class LegKinematics {
     return Eigen::Vector3d(frame.p.x(), frame.p.y(), frame.p.z());
   }
 
+  static Eigen::Vector3d compute_foot_vel(
+      const KDL::Chain& chain,
+      const std::vector<std::string>& joint_names,
+      const std::map<std::string, double>& joints,
+      const std::map<std::string, double>& joint_vels) {
+    unsigned n = chain.getNrOfJoints();
+    KDL::JntArray q(n), qdot(n);
+    for (unsigned i = 0; i < joint_names.size() && i < n; i++) {
+      auto it_p = joints.find(joint_names[i]);
+      q(i) = (it_p != joints.end()) ? it_p->second : 0.0;
+      auto it_v = joint_vels.find(joint_names[i]);
+      qdot(i) = (it_v != joint_vels.end()) ? it_v->second : 0.0;
+    }
+
+    KDL::Jacobian jac(n);
+    KDL::ChainJntToJacSolver solver(chain);
+    solver.JntToJac(q, jac);
+
+    // vel = J_linear @ qdot (top 3 rows)
+    Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+    for (unsigned j = 0; j < n; j++) {
+      for (int r = 0; r < 3; r++) {
+        vel(r) += jac(r, j) * qdot(j);
+      }
+    }
+    return vel;
+  }
+
   KDL::Chain chain_left_, chain_right_;
   std::unique_ptr<KDL::ChainFkSolverPos_recursive> fk_left_, fk_right_;
+  std::unique_ptr<KDL::ChainJntToJacSolver> jac_left_, jac_right_;
   std::vector<std::string> left_joint_names_, right_joint_names_;
   bool initialized_ = false;
 };
@@ -124,25 +168,35 @@ inline std::map<std::string, std::string> default_joint_mapping() {
 // Contact detection (effort threshold with hysteresis)
 class ContactDetector {
  public:
-  ContactDetector(double threshold = 5.0, double hysteresis = 1.0)
-      : threshold_(threshold), hysteresis_(hysteresis) {}
+  ContactDetector(double threshold = 5.0, double hysteresis = 1.0,
+                  double fk_z_threshold = 0.0)
+      : threshold_(threshold), hysteresis_(hysteresis),
+        fk_z_threshold_(fk_z_threshold) {}
 
-  std::pair<bool, bool> update(double effort_left, double effort_right) {
-    contact_left_ = detect(std::abs(effort_left), contact_left_);
-    contact_right_ = detect(std::abs(effort_right), contact_right_);
+  std::pair<bool, bool> update(double effort_left, double effort_right,
+                                double fk_z_left = 1.0, double fk_z_right = 1.0) {
+    contact_left_ = detect(std::abs(effort_left), contact_left_, fk_z_left);
+    contact_right_ = detect(std::abs(effort_right), contact_right_, fk_z_right);
     return {contact_left_, contact_right_};
   }
 
  private:
-  bool detect(double effort_abs, bool prev) {
+  bool detect(double effort_abs, bool prev, double fk_z) {
     double upper = threshold_ + hysteresis_;
     double lower = threshold_ - hysteresis_;
-    if (effort_abs > upper) return true;
-    if (effort_abs < lower) return false;
-    return prev;
+    bool result;
+    if (effort_abs > upper) result = true;
+    else if (effort_abs < lower) result = false;
+    else result = prev;
+
+    // FK Z 辅助: 脚低 = 更可能着地
+    if (fk_z_threshold_ != 0 && !result && prev && fk_z < fk_z_threshold_) {
+      result = true;  // 延迟判定为腾空
+    }
+    return result;
   }
 
-  double threshold_, hysteresis_;
+  double threshold_, hysteresis_, fk_z_threshold_;
   bool contact_left_ = false, contact_right_ = false;
 };
 

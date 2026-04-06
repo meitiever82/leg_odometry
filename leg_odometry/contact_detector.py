@@ -11,37 +11,53 @@ class ContactDetector:
     中间区域保持上一次状态。
     """
 
-    def __init__(self, threshold: float = 5.0, hysteresis: float = 1.0):
+    def __init__(self, threshold: float = 5.0, hysteresis: float = 1.0,
+                 fk_z_threshold: float = 0.0):
         self.threshold = threshold
         self.hysteresis = hysteresis
+        self.fk_z_threshold = fk_z_threshold  # FK Z 辅助 (0=关闭)
         self._contact_left = False
         self._contact_right = False
 
-    def update(self, effort_left: float, effort_right: float) -> tuple[bool, bool]:
+    def update(self, effort_left: float, effort_right: float,
+               fk_z_left: float = None, fk_z_right: float = None) -> tuple[bool, bool]:
         """更新接触状态。
 
         Args:
             effort_left:  左踝关节力矩 (Nm)
             effort_right: 右踝关节力矩 (Nm)
+            fk_z_left: 左脚 FK Z 坐标 (body 系，可选)
+            fk_z_right: 右脚 FK Z 坐标 (body 系，可选)
 
         Returns:
             (left_contact, right_contact)
         """
         self._contact_left = self._detect(
-            abs(effort_left), self._contact_left)
+            abs(effort_left), self._contact_left, fk_z_left)
         self._contact_right = self._detect(
-            abs(effort_right), self._contact_right)
+            abs(effort_right), self._contact_right, fk_z_right)
         return self._contact_left, self._contact_right
 
-    def _detect(self, effort_abs: float, prev_contact: bool) -> bool:
+    def _detect(self, effort_abs: float, prev_contact: bool,
+                fk_z: float = None) -> bool:
         upper = self.threshold + self.hysteresis
         lower = self.threshold - self.hysteresis
+
+        # 基本力矩检测
         if effort_abs > upper:
-            return True
+            result = True
         elif effort_abs < lower:
-            return False
+            result = False
         else:
-            return prev_contact
+            result = prev_contact
+
+        # FK Z 辅助: 脚低 = 更可能着地，滞后区间内优先判定着地
+        if self.fk_z_threshold != 0 and fk_z is not None:
+            if not result and prev_contact and fk_z < self.fk_z_threshold:
+                # 力矩说腾空，但脚还很低 → 延迟判定为腾空
+                result = True
+
+        return result
 
     @property
     def left_contact(self) -> bool:
