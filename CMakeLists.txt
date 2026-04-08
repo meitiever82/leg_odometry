@@ -14,16 +14,12 @@ find_package(builtin_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(orocos_kdl REQUIRED)
 
-# GTSAM
-set(GTSAM_DIR "$ENV{HOME}/Documents/local/gtsam-4.3/lib/cmake/GTSAM")
-find_package(GTSAM REQUIRED HINTS ${GTSAM_DIR})
+# GTSAM (system aarch64 install at /usr/local)
+find_package(GTSAM REQUIRED)
 
-# KDL parser
-set(KDL_PARSER_INCLUDE /opt/ros/humble/include/kdl_parser
-                        /opt/ros/humble/include/urdf
-                        /opt/ros/humble/include/urdfdom
-                        /opt/ros/humble/include/urdfdom_headers)
-set(KDL_PARSER_LIB /opt/ros/humble/lib/libkdl_parser.so)
+# KDL parser (use ament find)
+find_package(kdl_parser REQUIRED)
+find_package(urdf REQUIRED)
 
 # === ROS2 Node ===
 add_executable(leg_odom_node src/leg_odom_node.cpp)
@@ -31,39 +27,39 @@ target_include_directories(leg_odom_node PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${GTSAM_INCLUDE_DIR}
   ${orocos_kdl_INCLUDE_DIRS}
-  ${KDL_PARSER_INCLUDE}
 )
 target_link_libraries(leg_odom_node
   gtsam
   ${orocos_kdl_LIBRARIES}
-  ${KDL_PARSER_LIB}
 )
 ament_target_dependencies(leg_odom_node
   rclcpp sensor_msgs nav_msgs geometry_msgs tf2_ros builtin_interfaces
+  kdl_parser urdf
 )
 
 # === Offline evaluation (CSV, no ROS2 deps at runtime) ===
-add_executable(leg_odom_hybrid src/leg_odom_hybrid.cpp)
-target_include_directories(leg_odom_hybrid PRIVATE
+add_executable(leg_odom_app src/leg_odom_app.cpp)
+target_include_directories(leg_odom_app PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${GTSAM_INCLUDE_DIR}
 )
-target_link_libraries(leg_odom_hybrid gtsam)
+target_link_libraries(leg_odom_app gtsam)
 
 # === KDL test ===
 add_executable(test_kinematics src/test_kinematics.cpp)
 target_include_directories(test_kinematics PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${orocos_kdl_INCLUDE_DIRS}
-  ${KDL_PARSER_INCLUDE}
 )
 target_link_libraries(test_kinematics
   ${orocos_kdl_LIBRARIES}
-  ${KDL_PARSER_LIB}
+)
+ament_target_dependencies(test_kinematics
+  kdl_parser urdf
 )
 
 # Install
-install(TARGETS leg_odom_node leg_odom_hybrid test_kinematics
+install(TARGETS leg_odom_node leg_odom_app test_kinematics
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/
