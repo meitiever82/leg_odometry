@@ -38,12 +38,12 @@ ament_target_dependencies(leg_odom_node
 )
 
 # === Offline evaluation (CSV, no ROS2 deps at runtime) ===
-add_executable(leg_odom_app src/leg_odom_app.cpp)
-target_include_directories(leg_odom_app PRIVATE
+add_executable(test_leg_odom src/test_leg_odom.cpp)
+target_include_directories(test_leg_odom PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${GTSAM_INCLUDE_DIR}
 )
-target_link_libraries(leg_odom_app gtsam)
+target_link_libraries(test_leg_odom gtsam)
 
 # === KDL test ===
 add_executable(test_kinematics src/test_kinematics.cpp)
@@ -59,7 +59,7 @@ ament_target_dependencies(test_kinematics
 )
 
 # Install
-install(TARGETS leg_odom_node leg_odom_app test_kinematics
+install(TARGETS leg_odom_node test_leg_odom test_kinematics
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/
