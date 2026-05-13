@@ -2,7 +2,7 @@
 Author: meitiever
 Date: 2026-04-09 15:21:14
 LastEditors: meitiever
-LastEditTime: 2026-04-28 11:21:00
+LastEditTime: 2026-05-13 14:45:26
 Description: content
 '''
 #!/usr/bin/env python3
@@ -14,7 +14,7 @@ Description: content
   # 另一终端:
   ros2 bag play <bag_path> --clock -r 0.5
 
-URDF 默认从 ~/rtabmap_ws/urdf/casbot02_7dof_shell.urdf 读，
+URDF 默认从 ~/rtabmap_ws/casbot_02/urdf/casbot02_7dof_shell.urdf 读，
 也可用 urdf_path:= 或 CASBOT_URDF 环境变量覆盖。
 视觉 sanity check: bag 里的 LJ0/LJPITCH
 这些名字到 URDF joint 的映射对不对? 方向反没反, RViz 里看机器人摆动正不正常。
@@ -30,7 +30,7 @@ from launch_ros.substitutions import FindPackageShare
 
 DEFAULT_URDF = os.environ.get(
     'CASBOT_URDF',
-    os.path.expanduser('~/rtabmap_ws/urdf/casbot02_7dof_shell.urdf'),
+    os.path.expanduser('~/rtabmap_ws/casbot_02/urdf/casbot02_7dof_shell.urdf'),
 )
 
 def _spawn_robot_state_publisher(context, *args, **kwargs):
