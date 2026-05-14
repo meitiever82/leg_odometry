@@ -11,7 +11,6 @@ find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(builtin_interfaces REQUIRED)
-find_package(navigation_interface REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_executable(wheel_only_node src/wheel_only_node.cpp)
@@ -21,7 +20,6 @@ target_include_directories(wheel_only_node PRIVATE
 )
 ament_target_dependencies(wheel_only_node
   rclcpp sensor_msgs nav_msgs geometry_msgs tf2_ros builtin_interfaces
-  navigation_interface
 )
 
 install(TARGETS wheel_only_node

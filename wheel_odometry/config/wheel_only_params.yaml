@@ -1,42 +1,39 @@
 wheel_only_odom:
   ros__parameters:
-    # Geometry — must be calibrated per platform
-    wheelbase: 0.6        # L, front-to-rear distance between wheel contact points (m)
-    track:     0.5        # W, left-to-right distance (m)
-    # ChassisState.speed unit on the w2 platform: rad/s (NOT m/s as in spec).
-    # Multiply by wheel_radius to get ground velocity. 0.121 m calibrated on
-    # 2026-04-29 against /traj_imu.txt LIO truth → APE RMSE 1.22m / 60m path.
-    # Set to 1.0 if your platform's speed field is already m/s.
-    wheel_radius: 0.121
+    # ---- Geometry — calibrate per platform ----
+    wheelbase:    0.435   # L, front-to-rear distance between wheel contact points (m)
+    track:        0.400   # W, left-to-right distance (m)
+    # Multiplier on velocity field in /robot/wheel_status (sensor_msgs/JointState).
+    # 1.0 if velocity is already m/s; set to a wheel radius (m) if it is rad/s.
+    wheel_radius: 0.075
 
-    # Static window for gyro bias / gravity init
+    # ---- IMU ----
+    # The 2026-05-14 bag has NO IMU. Leave enable_imu=false unless your bag
+    # has /imu. With enable_imu=false, gyro/Mahony are bypassed and yaw_source
+    # is forced to "ls".
+    enable_imu:      false
     bias_window_sec: 3.0
-
-    # Accel-tilt Mahony — pulls R's roll/pitch toward gravity
     tilt_kp:         1.0
-    tilt_accel_band: 0.5  # |a_norm - 9.81| < this → accel is quasi-static
+    tilt_accel_band: 0.5
 
-    # Yaw policy
-    # Default "gyro": use IMU gyro_z (after auto-mount calibration). Robust to
-    #   wheel-slip and to wrong wheelbase/track. Drifts long-term, but on the
-    #   w2 test bag (542m / 186s) this gave 0.83% closure — better than LS.
-    # "ls": use the LS-derived ω_z. Theoretically drift-free, but biased when
-    #   wheelbase/track or wheel-radius calibration is off. Only use this when
-    #   you have accurate platform geometry.
-    yaw_source:    "gyro"
-    slip_threshold: 0.5   # m/s, if LS residual > this, fall back to gyro
+    # ---- Yaw policy ----
+    # "ls":   ω_z from the 8×3 LS solve (only valid when enable_imu=false or
+    #         when geometry calibration is trusted; drift-free in principle).
+    # "gyro": ω_z from IMU after auto-mount calibration (requires enable_imu=true).
+    yaw_source:    "ls"
+    slip_threshold: 0.5
 
-    # FlatZ clamp on p.z (flat-floor prior)
+    # ---- FlatZ clamp on p.z (flat-floor prior) ----
     flatz_enabled: true
     flatz_alpha:   0.05
 
-    # ROS output
+    # ---- ROS output ----
     publish_tf:    true
     odom_frame:    "odom"
     base_frame:    "base_link_wheel_odom"
     odom_topic:    "/wheel_odometry"
     chassis_topic: "/robot/wheel_status"
-    imu_topic:     "/rslidar_imu_data"
+    imu_topic:     "/imu"
 
-    # Optional diagnostic CSV (empty = disabled)
-    diag_csv_path: ""
+    # Empty string disables CSV logging.
+    diag_csv_path: "/tmp/wheel_odom.csv"

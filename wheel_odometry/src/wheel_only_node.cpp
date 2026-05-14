@@ -3,26 +3,23 @@
  * @brief Swerve-only wheel odometry ROS2 node.
  *
  * State:    p ∈ R³, R ∈ SO(3), gyro_bias ∈ R³.
- * No Kalman filter; mirrors leg_odometry/fk_only_node, with the leg-FK module
- * replaced by a 4-wheel swerve LS solver (see swerve_kinematics.h).
- *
- * Pipeline (driven by /chassis_state):
+ * Pipeline (driven by /robot/wheel_status, sensor_msgs/JointState):
  *   1. solve LS:                     (vx_b, vy_b, ω_z_LS, residual)
- *   2. propagate R from gyro:        ω_used = (residual < slip_thr) ?
- *                                       (gyro_xy, ω_z_LS) : gyro_xyz
+ *   2. propagate R:                  yaw_source ∈ {ls, gyro}
  *                                    R ← R · exp_so3((ω_used) · dt)
  *   3. accel-tilt Mahony (gated):    pulls R's roll/pitch toward gravity,
- *                                    keeps yaw free
+ *                                    keeps yaw free.  Skipped if no IMU.
  *   4. body velocity in world:       v_world = R · (vx_b, vy_b, 0)
  *   5. position integration:         p ← p + v_world · dt
  *   6. FlatZ clamp:                  p.z ← (1-α) · p.z   (flat-floor prior)
  *
- * Subscribes: /imu, /chassis_state
- * Publishes:  /wheel_odometry, TF odom → base_link_wheel_odom
+ * Subscribes: /robot/wheel_status (JointState; 4 names, position=θ, velocity=v),
+ *             /imu                (optional — node operates fine without it).
+ * Publishes:  /wheel_odometry, TF odom → base_frame.
  *
- * Why use LS yaw instead of gyro yaw: with 4 swerve wheels, ω_z is observable
- * from kinematics alone (no integration → no drift). Gyro retains pitch/roll
- * (which wheels don't observe) and serves as the slip-fallback for yaw.
+ * Wheel name → index mapping: looks for substrings "front_left" / "front_right"
+ * / "rear_left" / "rear_right" in JointState.name. Falls back to position 0..3
+ * (= FL, FR, RL, RR) if names are absent.
  */
 
 #include <array>
@@ -30,78 +27,77 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
-#include "navigation_interface/msg/wheel_status.hpp"
 #include "wheel_odometry/so3_utils.h"
 #include "wheel_odometry/swerve_kinematics.h"
 
 namespace {
 
 constexpr double kGravity = 9.81;
-constexpr double kMaxDt   = 0.2;   // s, reject chassis_state cb with stale dt
+constexpr double kMaxDt   = 0.2;   // s, reject stale chassis dt
+
+// Find index of a wheel by substring of its joint name. Returns -1 if missing.
+int find_wheel(const std::vector<std::string>& names, const char* key) {
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (names[i].find(key) != std::string::npos) return static_cast<int>(i);
+  }
+  return -1;
+}
 
 }  // namespace
 
 class WheelOnlyNode : public rclcpp::Node {
  public:
   WheelOnlyNode() : Node("wheel_only_odom") {
-    // --- geometry ---
-    declare_parameter("wheelbase",   0.6);   // L, front-to-rear (m)
-    declare_parameter("track",       0.5);   // W, left-to-right (m)
-    // ChassisState.speed is documented as m/s, but on the w2 platform it is
-    // actually wheel angular velocity in rad/s — multiplying by wheel_radius
-    // recovers ground speed. Default 1.0 → use speed field verbatim.
+    declare_parameter("wheelbase",   0.6);
+    declare_parameter("track",       0.5);
     declare_parameter("wheel_radius", 1.0);
 
-    // --- init window ---
     declare_parameter("bias_window_sec", 3.0);
-
-    // --- accel-tilt Mahony ---
     declare_parameter("tilt_kp",         1.0);
     declare_parameter("tilt_accel_band", 0.5);
 
-    // --- yaw-source policy ---
-    declare_parameter("yaw_source", std::string("ls"));   // "ls" | "gyro"
-    declare_parameter("slip_threshold", 0.5);             // m/s, LS residual gate
+    declare_parameter("yaw_source",     std::string("ls"));
+    declare_parameter("slip_threshold", 0.5);
 
-    // --- FlatZ clamp ---
     declare_parameter("flatz_enabled", true);
     declare_parameter("flatz_alpha",   0.05);
 
-    // --- ROS output ---
-    declare_parameter("publish_tf", true);
-    declare_parameter("odom_frame", std::string("odom"));
-    declare_parameter("base_frame", std::string("base_link_wheel_odom"));
-    declare_parameter("odom_topic", std::string("/wheel_odometry"));
-    declare_parameter("chassis_topic", std::string("/chassis_state"));
+    declare_parameter("publish_tf",    true);
+    declare_parameter("odom_frame",    std::string("odom"));
+    declare_parameter("base_frame",    std::string("base_link_wheel_odom"));
+    declare_parameter("odom_topic",    std::string("/wheel_odometry"));
+    declare_parameter("chassis_topic", std::string("/robot/wheel_status"));
     declare_parameter("imu_topic",     std::string("/imu"));
+    declare_parameter("enable_imu",    false);
 
-    // --- diagnostic CSV ---
     declare_parameter("diag_csv_path", std::string(""));
 
     geom_ = wheel_odom::WheelGeometry::from_LW(
         get_parameter("wheelbase").as_double(),
         get_parameter("track").as_double());
-    wheel_radius_ = get_parameter("wheel_radius").as_double();
-
-    bias_window_sec_ = get_parameter("bias_window_sec").as_double();
-    tilt_kp_         = get_parameter("tilt_kp").as_double();
-    tilt_accel_band_ = get_parameter("tilt_accel_band").as_double();
-    yaw_source_      = get_parameter("yaw_source").as_string();
-    slip_threshold_  = get_parameter("slip_threshold").as_double();
-    flatz_enabled_   = get_parameter("flatz_enabled").as_bool();
-    flatz_alpha_     = get_parameter("flatz_alpha").as_double();
-    publish_tf_      = get_parameter("publish_tf").as_bool();
-    odom_frame_      = get_parameter("odom_frame").as_string();
-    base_frame_      = get_parameter("base_frame").as_string();
+    wheel_radius_   = get_parameter("wheel_radius").as_double();
+    bias_window_sec_= get_parameter("bias_window_sec").as_double();
+    tilt_kp_        = get_parameter("tilt_kp").as_double();
+    tilt_accel_band_= get_parameter("tilt_accel_band").as_double();
+    yaw_source_     = get_parameter("yaw_source").as_string();
+    slip_threshold_ = get_parameter("slip_threshold").as_double();
+    flatz_enabled_  = get_parameter("flatz_enabled").as_bool();
+    flatz_alpha_    = get_parameter("flatz_alpha").as_double();
+    publish_tf_     = get_parameter("publish_tf").as_bool();
+    odom_frame_     = get_parameter("odom_frame").as_string();
+    base_frame_     = get_parameter("base_frame").as_string();
+    enable_imu_     = get_parameter("enable_imu").as_bool();
     const auto odom_topic    = get_parameter("odom_topic").as_string();
     const auto chassis_topic = get_parameter("chassis_topic").as_string();
     const auto imu_topic     = get_parameter("imu_topic").as_string();
@@ -111,6 +107,14 @@ class WheelOnlyNode : public rclcpp::Node {
           "yaw_source='%s' invalid, falling back to 'ls'", yaw_source_.c_str());
       yaw_source_ = "ls";
     }
+    if (!enable_imu_ && yaw_source_ == "gyro") {
+      RCLCPP_WARN(get_logger(),
+          "enable_imu=false but yaw_source=gyro — forcing yaw_source=ls");
+      yaw_source_ = "ls";
+    }
+    // Without IMU we have no bias-init window; initialise immediately so the
+    // first chassis message can do useful work.
+    if (!enable_imu_) init_done_ = true;
 
     const auto diag_path = get_parameter("diag_csv_path").as_string();
     if (!diag_path.empty()) {
@@ -122,16 +126,16 @@ class WheelOnlyNode : public rclcpp::Node {
       }
     }
 
-    // QoS: chassis is RELIABLE on the device, IMU is typically BEST_EFFORT
-    // (sensor_data style). Use SensorDataQoS for IMU so rosbag2 replay matches.
     const auto chassis_qos = rclcpp::QoS(rclcpp::KeepLast(2000)).reliable();
-    const auto imu_qos     = rclcpp::SensorDataQoS().keep_last(2000);
-    chassis_sub_ = create_subscription<navigation_interface::msg::WheelStatus>(
+    chassis_sub_ = create_subscription<sensor_msgs::msg::JointState>(
         chassis_topic, chassis_qos,
         std::bind(&WheelOnlyNode::chassis_cb, this, std::placeholders::_1));
-    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-        imu_topic, imu_qos,
-        std::bind(&WheelOnlyNode::imu_cb, this, std::placeholders::_1));
+    if (enable_imu_) {
+      const auto imu_qos = rclcpp::SensorDataQoS().keep_last(2000);
+      imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+          imu_topic, imu_qos,
+          std::bind(&WheelOnlyNode::imu_cb, this, std::placeholders::_1));
+    }
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic, 10);
     tf_bc_    = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -140,23 +144,21 @@ class WheelOnlyNode : public rclcpp::Node {
     bg_.setZero();
 
     RCLCPP_INFO(get_logger(),
-        "wheel_only_odom started: L=%.3f W=%.3f  bias_window=%.1fs  "
-        "tilt_kp=%.2f band=%.2f  yaw_source=%s slip_thr=%.3f  "
-        "flatz=%s α=%.3f  topic=%s",
+        "wheel_only_odom: L=%.3f W=%.3f r=%.3f  imu=%s yaw_source=%s "
+        "slip_thr=%.3f  flatz=%s α=%.3f  chassis=%s odom=%s",
         get_parameter("wheelbase").as_double(),
-        get_parameter("track").as_double(),
-        bias_window_sec_, tilt_kp_, tilt_accel_band_,
-        yaw_source_.c_str(), slip_threshold_,
+        get_parameter("track").as_double(), wheel_radius_,
+        enable_imu_ ? "on" : "off", yaw_source_.c_str(), slip_threshold_,
         flatz_enabled_ ? "on" : "off", flatz_alpha_,
-        odom_topic.c_str());
+        chassis_topic.c_str(), odom_topic.c_str());
   }
 
   ~WheelOnlyNode() { if (diag_fp_) std::fclose(diag_fp_); }
 
  private:
   // -------------------------------------------------------------------------
-  // IMU callback — accumulate bias during init window, otherwise cache the
-  // debiased gyro and raw accel for chassis_cb to consume.
+  // IMU callback — bias init + cache for chassis_cb. Only wired up when
+  // enable_imu=true.
   // -------------------------------------------------------------------------
   void imu_cb(const sensor_msgs::msg::Imu::SharedPtr msg) {
     const Eigen::Vector3d g(msg->angular_velocity.x,
@@ -179,36 +181,57 @@ class WheelOnlyNode : public rclcpp::Node {
       if (n_static_ > 0) {
         bg_ = accum_gyro_ / n_static_;
         const Eigen::Vector3d avg_a = accum_accel_ / n_static_;
-        // Auto-calibrate IMU-to-base mount from observed gravity. After this,
-        // R_base_imu_ * a_imu gives accel in base frame, with gravity along
-        // world +Z when the robot is upright. R_ (base→world) starts as
-        // identity since we now own the alignment via R_base_imu_.
         const Eigen::Vector3d up_imu = avg_a.normalized();
         const Eigen::Vector3d up_base(0, 0, 1);
         R_base_imu_ = Eigen::Quaterniond::FromTwoVectors(up_imu, up_base).toRotationMatrix();
         R_.setIdentity();
-
         const auto rpy_mount = R_to_rpy(R_base_imu_);
         RCLCPP_INFO(get_logger(),
-            "init done (%d samples): bg=[%+.5f,%+.5f,%+.5f] rad/s  "
-            "avg_accel_imu=[%+.3f,%+.3f,%+.3f]  R_base_imu rpy=[%+.2f,%+.2f,%+.2f] deg",
+            "init done (%d samples): bg=[%+.5f,%+.5f,%+.5f]  "
+            "R_base_imu rpy=[%+.2f,%+.2f,%+.2f] deg",
             n_static_, bg_.x(), bg_.y(), bg_.z(),
-            avg_a.x(), avg_a.y(), avg_a.z(),
             rpy_mount[0] * 180.0 / M_PI, rpy_mount[1] * 180.0 / M_PI,
             rpy_mount[2] * 180.0 / M_PI);
       }
       init_done_ = true;
     }
-    // Apply mount calibration: rotate IMU readings into base frame.
     last_gyro_  = R_base_imu_ * (g - bg_);
     last_accel_ = R_base_imu_ * a;
+    has_accel_  = true;
   }
 
   // -------------------------------------------------------------------------
   // Chassis-state callback — main state update.
   // -------------------------------------------------------------------------
-  void chassis_cb(const navigation_interface::msg::WheelStatus::SharedPtr msg) {
-    const double t_abs = msg->stamp.sec + msg->stamp.nanosec * 1e-9;
+  void chassis_cb(const sensor_msgs::msg::JointState::SharedPtr msg) {
+    if (msg->position.size() < 4 || msg->velocity.size() < 4) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "JointState has <4 wheels (pos=%zu vel=%zu); dropping",
+          msg->position.size(), msg->velocity.size());
+      return;
+    }
+
+    // Resolve FL/FR/RL/RR indices once (cache after first message).
+    if (!idx_resolved_) {
+      const auto& names = msg->name;
+      idx_fl_ = find_wheel(names, "front_left");
+      idx_fr_ = find_wheel(names, "front_right");
+      idx_rl_ = find_wheel(names, "rear_left");
+      idx_rr_ = find_wheel(names, "rear_right");
+      if (idx_fl_ < 0 || idx_fr_ < 0 || idx_rl_ < 0 || idx_rr_ < 0) {
+        idx_fl_ = 0; idx_fr_ = 1; idx_rl_ = 2; idx_rr_ = 3;
+        RCLCPP_WARN(get_logger(),
+            "JointState names not 'front_left'/.../'rear_right'; "
+            "falling back to position 0..3 = FL,FR,RL,RR");
+      } else {
+        RCLCPP_INFO(get_logger(),
+            "wheel indices resolved: FL=%d FR=%d RL=%d RR=%d",
+            idx_fl_, idx_fr_, idx_rl_, idx_rr_);
+      }
+      idx_resolved_ = true;
+    }
+
+    const double t_abs = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
     if (last_t_ < 0.0) { last_t_ = t_abs; return; }
     const double dt = t_abs - last_t_;
     last_t_ = t_abs;
@@ -216,21 +239,27 @@ class WheelOnlyNode : public rclcpp::Node {
 
     // ---- 1. swerve LS ----
     const std::array<double, 4> angles = {
-        msg->front_left_angle, msg->front_right_angle,
-        msg->rear_left_angle,  msg->rear_right_angle,
+        msg->position[idx_fl_], msg->position[idx_fr_],
+        msg->position[idx_rl_], msg->position[idx_rr_],
     };
     const std::array<double, 4> speeds = {
-        msg->front_left_speed * wheel_radius_, msg->front_right_speed * wheel_radius_,
-        msg->rear_left_speed  * wheel_radius_, msg->rear_right_speed  * wheel_radius_,
+        msg->velocity[idx_fl_] * wheel_radius_,
+        msg->velocity[idx_fr_] * wheel_radius_,
+        msg->velocity[idx_rl_] * wheel_radius_,
+        msg->velocity[idx_rr_] * wheel_radius_,
     };
     const auto sol = wheel_odom::solve_body_twist(angles, speeds, geom_);
 
     // ---- 2. choose ω_used and propagate R ----
     const bool can_use_ls_yaw =
         (yaw_source_ == "ls") && (sol.residual < slip_threshold_);
-    Eigen::Vector3d omega_used = last_gyro_;
+    Eigen::Vector3d omega_used = last_gyro_;  // zero if !enable_imu_
     if (can_use_ls_yaw) {
       omega_used.z() = sol.omega_z;
+    } else if (yaw_source_ == "ls") {
+      // residual gated us out — keep yaw frozen this tick rather than rolling
+      // back to a stale gyro that may also be zero.
+      omega_used.z() = 0.0;
     }
     if (init_done_) {
       R_ = R_ * wheel_odom::exp_so3(omega_used * dt);
@@ -238,7 +267,7 @@ class WheelOnlyNode : public rclcpp::Node {
 
     // ---- 3. accel-tilt Mahony (yaw kept free) ----
     tilt_applied_ = false;
-    if (init_done_) {
+    if (init_done_ && has_accel_) {
       const double a_norm = last_accel_.norm();
       if (a_norm > 1e-3 && std::abs(a_norm - kGravity) < tilt_accel_band_) {
         const Eigen::Vector3d g_body_meas = last_accel_ / a_norm;
@@ -276,7 +305,7 @@ class WheelOnlyNode : public rclcpp::Node {
           static_cast<int>(can_use_ls_yaw));
     }
 
-    publish(msg->stamp, v_world, omega_used);
+    publish(msg->header.stamp, v_world, omega_used);
   }
 
   void publish(const builtin_interfaces::msg::Time& stamp,
@@ -327,6 +356,7 @@ class WheelOnlyNode : public rclcpp::Node {
   std::string yaw_source_;
   std::string odom_frame_, base_frame_;
   bool   publish_tf_{true};
+  bool   enable_imu_{false};
   double bias_window_sec_{3.0};
   double tilt_kp_{1.0};
   double tilt_accel_band_{0.5};
@@ -334,15 +364,20 @@ class WheelOnlyNode : public rclcpp::Node {
   bool   flatz_enabled_{true};
   double flatz_alpha_{0.05};
 
+  // --- wheel index cache ---
+  bool idx_resolved_{false};
+  int  idx_fl_{0}, idx_fr_{1}, idx_rl_{2}, idx_rr_{3};
+
   // --- state ---
   Eigen::Vector3d p_{Eigen::Vector3d::Zero()};
-  Eigen::Matrix3d R_{Eigen::Matrix3d::Identity()};         // base → world
-  Eigen::Vector3d bg_{Eigen::Vector3d::Zero()};            // gyro bias (in IMU frame)
-  Eigen::Matrix3d R_base_imu_{Eigen::Matrix3d::Identity()}; // mount, set during init
+  Eigen::Matrix3d R_{Eigen::Matrix3d::Identity()};
+  Eigen::Vector3d bg_{Eigen::Vector3d::Zero()};
+  Eigen::Matrix3d R_base_imu_{Eigen::Matrix3d::Identity()};
 
   // --- IMU → chassis_cb cache ---
   Eigen::Vector3d last_gyro_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d last_accel_{Eigen::Vector3d::Zero()};
+  bool has_accel_{false};
 
   // --- timing / diagnostics ---
   double last_t_{-1.0};
@@ -356,12 +391,11 @@ class WheelOnlyNode : public rclcpp::Node {
   bool init_done_{false};
 
   // --- ROS2 I/O ---
-  rclcpp::Subscription<navigation_interface::msg::WheelStatus>::SharedPtr chassis_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr             imu_sub_;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr              odom_pub_;
-  std::unique_ptr<tf2_ros::TransformBroadcaster>                     tf_bc_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr chassis_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr        imu_sub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster>                tf_bc_;
 
-  // --- diagnostic CSV ---
   std::FILE* diag_fp_{nullptr};
 };
 
