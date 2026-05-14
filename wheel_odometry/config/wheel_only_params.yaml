@@ -4,8 +4,7 @@ wheel_only_odom:
     wheelbase:    0.435   # L, front-to-rear distance between wheel contact points (m)
     track:        0.400   # W, left-to-right distance (m)
     # Multiplier on velocity field in /robot/wheel_status (sensor_msgs/JointState).
-    # 1.0 if velocity is already m/s; set to a wheel radius (m) if it is rad/s.
-    wheel_radius: 0.075
+    wheel_radius: 1.0  # in-fact, it is not used
 
     # ---- IMU ----
     # The 2026-05-14 bag has NO IMU. Leave enable_imu=false unless your bag
@@ -21,6 +20,10 @@ wheel_only_odom:
     #         when geometry calibration is trusted; drift-free in principle).
     # "gyro": ω_z from IMU after auto-mount calibration (requires enable_imu=true).
     yaw_source:    "ls"
+    # Residual is in m/s. /robot/wheel_status.velocity is already m/s on this
+    # platform (firmware does ω·r internally), so wheel_radius does not enter
+    # the LS — keep slip_threshold an absolute m/s value, ~0.5 is comfortable
+    # margin above observed clean-data residuals (max ~0.14 m/s).
     slip_threshold: 0.5
 
     # ---- FlatZ clamp on p.z (flat-floor prior) ----

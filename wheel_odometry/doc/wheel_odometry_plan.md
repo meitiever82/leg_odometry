@@ -2,7 +2,7 @@
  * @Author: meitiever
  * @Date: 2026-05-13 16:00:44
  * @LastEditors: meitiever
- * @LastEditTime: 2026-05-13 17:09:02
+ * @LastEditTime: 2026-05-14 16:44:28
  * @Description: content
 -->
 # Wheel Odometry Plan
@@ -107,11 +107,11 @@ header:
   stamp: {sec: 1778574055, nanosec: 358339136}
   frame_id: "base_link"
 name:     ["front_left", "front_right", "rear_left", "rear_right"]
-position: [9.59, -9.59, 9.59, -9.59]        # 转向角
-velocity: [-0.04, -1.65, 1.68, 1.66]        # 轮速
+position: [1.50, -1.50, 1.50, -1.50]        # 转向角
+velocity: [-0.04, -1.65, -1.68, -1.66]        # 轮速
 effort:   []
 
-- position 记录的是轮子当前的朝向，x 轴是车头方向, 此位置输出为0，逆时针为正，顺时针为负。所以取值范围为 -90度 - 90度。
+- position 记录的是轮子当前的朝向，x 轴是车头方向, 此位置输出为0，逆时针为正，顺时针为负。所以取值范围为 -90度 - 90度。输出为弧度，所以应该是 -1.57079 - 1.57079 之间。
 - velocity 输出为轮速(m/s),向前为正,向後为负。最大速度为 1.0 m/s。
 
 ### 0.5 输入契约(归一层)
