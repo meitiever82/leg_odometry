@@ -24,7 +24,15 @@ wheel_only_odom:
     # platform (firmware does ω·r internally), so wheel_radius does not enter
     # the LS — keep slip_threshold an absolute m/s value, ~0.5 is comfortable
     # margin above observed clean-data residuals (max ~0.14 m/s).
-    slip_threshold: 0.5
+    slip_threshold: 0.1
+
+    # ---- Chassis stream gating ----
+    # Max chassis stamp dt (s) the node will still integrate. Larger gaps drop
+    # the tick (no odom that cycle). /robot/wheel_status is bursty on this
+    # platform — it stalls then dumps a batch; observed worst gap ~1.0 s (bag
+    # 2026-05-14 and on-robot). 1.2 covers it so real motion is integrated, not
+    # lost. Watch the [diag] summary's "dt>..s" counter to tune.
+    max_dt: 1.2
 
     # ---- FlatZ clamp on p.z (flat-floor prior) ----
     flatz_enabled: true
@@ -38,5 +46,6 @@ wheel_only_odom:
     chassis_topic: "/robot/wheel_status"
     imu_topic:     "/imu"
 
-    # Empty string disables CSV logging.
+    # Empty string disables CSV logging — leave empty; live PNG is produced
+    # by the trajectory_plotter node spawned from the launch file.
     diag_csv_path: "/tmp/wheel_odom.csv"

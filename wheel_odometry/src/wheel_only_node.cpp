@@ -23,7 +23,9 @@
  */
 
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -44,7 +46,11 @@
 namespace {
 
 constexpr double kGravity = 9.81;
-constexpr double kMaxDt   = 0.2;   // s, reject stale chassis dt
+// Default ceiling on chassis stamp dt (s). Overridable via the 'max_dt' ROS
+// param. Sized above the sensor's observed worst burst gap (~1.0 s, both on the
+// 2026-05-14 bag and on-robot) so real motion across a gap is integrated,
+// not dropped. The chassis stream is bursty (sensor-side); see [diag] logs.
+constexpr double kDefaultMaxDt = 1.2;
 
 // Find index of a wheel by substring of its joint name. Returns -1 if missing.
 int find_wheel(const std::vector<std::string>& names, const char* key) {
@@ -69,6 +75,8 @@ class WheelOnlyNode : public rclcpp::Node {
 
     declare_parameter("yaw_source",     std::string("ls"));
     declare_parameter("slip_threshold", 0.5);
+    // Max chassis stamp dt (s) still integrated; larger gaps drop the tick.
+    declare_parameter("max_dt",         kDefaultMaxDt);
 
     declare_parameter("flatz_enabled", true);
     declare_parameter("flatz_alpha",   0.05);
@@ -83,6 +91,9 @@ class WheelOnlyNode : public rclcpp::Node {
 
     declare_parameter("diag_csv_path", std::string(""));
 
+    // Period (s) of the periodic [diag] summary log; <=0 disables it.
+    declare_parameter("diag_log_period_sec", 2.0);
+
     geom_ = wheel_odom::WheelGeometry::from_LW(
         get_parameter("wheelbase").as_double(),
         get_parameter("track").as_double());
@@ -92,6 +103,7 @@ class WheelOnlyNode : public rclcpp::Node {
     tilt_accel_band_= get_parameter("tilt_accel_band").as_double();
     yaw_source_     = get_parameter("yaw_source").as_string();
     slip_threshold_ = get_parameter("slip_threshold").as_double();
+    max_dt_         = get_parameter("max_dt").as_double();
     flatz_enabled_  = get_parameter("flatz_enabled").as_bool();
     flatz_alpha_    = get_parameter("flatz_alpha").as_double();
     publish_tf_     = get_parameter("publish_tf").as_bool();
@@ -139,16 +151,28 @@ class WheelOnlyNode : public rclcpp::Node {
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic, 10);
     tf_bc_    = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
+    diag_log_period_sec_ = get_parameter("diag_log_period_sec").as_double();
+    if (diag_log_period_sec_ > 0.0) {
+      diag_timer_ = create_wall_timer(
+          std::chrono::duration<double>(diag_log_period_sec_),
+          std::bind(&WheelOnlyNode::diag_timer_cb, this));
+    }
+    RCLCPP_INFO(get_logger(),
+        "[diag] subscribed to '%s' (QoS KeepLast 2000, RELIABLE) — waiting for "
+        "first message; [diag] summary every %.1fs",
+        chassis_topic.c_str(), diag_log_period_sec_);
+
     p_.setZero();
     R_.setIdentity();
     bg_.setZero();
 
     RCLCPP_INFO(get_logger(),
-        "wheel_only_odom: L=%.3f W=%.3f r=%.3f  imu=%s yaw_source=%s "
-        "slip_thr=%.3f  flatz=%s α=%.3f  chassis=%s odom=%s",
+        "wheel_only_odom: L=%.3f W=%.3f imu=%s yaw_source=%s "
+        "slip_thr=%.3f  max_dt=%.2f  flatz=%s α=%.3f  chassis=%s odom=%s",
         get_parameter("wheelbase").as_double(),
-        get_parameter("track").as_double(), wheel_radius_,
+        get_parameter("track").as_double(),
         enable_imu_ ? "on" : "off", yaw_source_.c_str(), slip_threshold_,
+        max_dt_,
         flatz_enabled_ ? "on" : "off", flatz_alpha_,
         chassis_topic.c_str(), odom_topic.c_str());
   }
@@ -161,6 +185,10 @@ class WheelOnlyNode : public rclcpp::Node {
   // enable_imu=true.
   // -------------------------------------------------------------------------
   void imu_cb(const sensor_msgs::msg::Imu::SharedPtr msg) {
+    if (!first_imu_logged_) {
+      RCLCPP_INFO(get_logger(), "[diag] first /imu message received");
+      first_imu_logged_ = true;
+    }
     const Eigen::Vector3d g(msg->angular_velocity.x,
                             msg->angular_velocity.y,
                             msg->angular_velocity.z);
@@ -204,7 +232,31 @@ class WheelOnlyNode : public rclcpp::Node {
   // Chassis-state callback — main state update.
   // -------------------------------------------------------------------------
   void chassis_cb(const sensor_msgs::msg::JointState::SharedPtr msg) {
+    // ---- arrival / latency diagnostics ----
+    const auto wall_now = std::chrono::steady_clock::now();
+    ++rx_count_;
+    double wall_dt = -1.0;
+    if (have_last_chassis_wall_) {
+      wall_dt = std::chrono::duration<double>(wall_now - last_chassis_wall_).count();
+    }
+    last_chassis_wall_ = wall_now;
+    have_last_chassis_wall_ = true;
+    const double now_ros = this->now().seconds();
+
+    if (!first_chassis_logged_) {
+      const double since_start =
+          std::chrono::duration<double>(wall_now - node_start_wall_).count();
+      const double stamp0 =
+          msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+      RCLCPP_INFO(get_logger(),
+          "[diag] FIRST /robot/wheel_status arrived %.2fs after node start | "
+          "header.stamp=%.3f node.now=%.3f stamp_vs_now=%+.3fs",
+          since_start, stamp0, now_ros, now_ros - stamp0);
+      first_chassis_logged_ = true;
+    }
+
     if (msg->position.size() < 4 || msg->velocity.size() < 4) {
+      ++drop_bad_size_;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
           "JointState has <4 wheels (pos=%zu vel=%zu); dropping",
           msg->position.size(), msg->velocity.size());
@@ -232,10 +284,45 @@ class WheelOnlyNode : public rclcpp::Node {
     }
 
     const double t_abs = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
-    if (last_t_ < 0.0) { last_t_ = t_abs; return; }
-    const double dt = t_abs - last_t_;
+    if (last_t_ < 0.0) {
+      last_t_ = t_abs;
+      RCLCPP_INFO(get_logger(),
+          "[diag] first stamp seen (%.3f); last_t initialised, no odom this "
+          "tick (expected — needs two messages to form a dt)", t_abs);
+      return;
+    }
+    const double prev_t = last_t_;
+    const double dt = t_abs - prev_t;
     last_t_ = t_abs;
-    if (dt <= 0.0 || dt > kMaxDt) return;
+
+    // stamp_dt  = sensor-clock gap between messages (drives integration)
+    // wall_dt   = real time between callbacks (how fast they actually arrive)
+    // stamp_vs_now = how far the sensor stamp lags the node clock
+    // Compare them: wall_dt small but stamp_dt large => sensor stamps are bad;
+    // both large => sensor genuinely publishes slowly; stamp_vs_now large &
+    // growing => buffering / clock-domain mismatch.
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "[diag] chassis: stamp_dt=%.3fs wall_dt=%.3fs stamp_vs_now=%+.3fs "
+        "(arrival~%.1fHz)",
+        dt, wall_dt, now_ros - t_abs,
+        wall_dt > 1e-6 ? 1.0 / wall_dt : 0.0);
+
+    if (dt <= 0.0) {
+      ++drop_dt_nonpos_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "[diag] DROP (no odom): chassis stamp dt=%.4fs <= 0 "
+          "(t_abs=%.3f prev=%.3f) — sensor timestamps not monotonic", dt,
+          t_abs, prev_t);
+      return;
+    }
+    if (dt > max_dt_) {
+      ++drop_dt_big_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+          "[diag] DROP (no odom): chassis stamp dt=%.3fs > max_dt=%.2fs — gap "
+          "in the sensor stream (low rate / pause / startup); wall_dt=%.3fs",
+          dt, max_dt_, wall_dt);
+      return;
+    }
 
     // ---- 1. swerve LS ----
     const std::array<double, 4> angles = {
@@ -305,12 +392,14 @@ class WheelOnlyNode : public rclcpp::Node {
           static_cast<int>(can_use_ls_yaw));
     }
 
-    publish(msg->header.stamp, v_world, omega_used);
+    publish(msg->header.stamp, v_body, omega_used, sol.residual);
+    ++pub_count_;
   }
 
   void publish(const builtin_interfaces::msg::Time& stamp,
-               const Eigen::Vector3d& v_world,
-               const Eigen::Vector3d& omega_used) {
+               const Eigen::Vector3d& v_body,
+               const Eigen::Vector3d& omega_used,
+               double ls_residual) {
     Eigen::Quaterniond q(R_);
     q.normalize();
 
@@ -325,12 +414,19 @@ class WheelOnlyNode : public rclcpp::Node {
     odom.pose.pose.orientation.y = q.y();
     odom.pose.pose.orientation.z = q.z();
     odom.pose.pose.orientation.w = q.w();
-    odom.twist.twist.linear.x   = v_world.x();
-    odom.twist.twist.linear.y   = v_world.y();
-    odom.twist.twist.linear.z   = v_world.z();
+    // Twist is reported in child_frame_id (body) per ROS convention. The LS
+    // solution is already in body frame; no rotation needed.
+    odom.twist.twist.linear.x   = v_body.x();
+    odom.twist.twist.linear.y   = v_body.y();
+    odom.twist.twist.linear.z   = v_body.z();
     odom.twist.twist.angular.x  = omega_used.x();
     odom.twist.twist.angular.y  = omega_used.y();
     odom.twist.twist.angular.z  = omega_used.z();
+    // Squat covariance[0] as a diagnostic channel: LS residual (m/s).
+    // Consumers that read covariance for real uncertainty should ignore this
+    // node; covariance[0]<0 would mark "unknown". The trajectory_plotter
+    // reads this slot to render the residual time series.
+    odom.twist.covariance[0]    = ls_residual;
     odom_pub_->publish(odom);
 
     if (publish_tf_) {
@@ -345,9 +441,73 @@ class WheelOnlyNode : public rclcpp::Node {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Periodic [diag] summary — the headline tool for localising the latency:
+  // per interval it reports how many chassis messages arrived vs how many odom
+  // messages were published, and (when ticks were dropped) the reason.
+  //   * rx=0 for a long stretch, then a FIRST-message line  -> sensor/discovery
+  //     side: the publisher itself is late. Not this node's code.
+  //   * rx>0 but odom_pub=0 with dt>max_dt high             -> stream is gappy
+  //     (sensor low rate / bad stamps); cross-check the per-message [diag] line.
+  //   * rx≈odom_pub                                         -> pipeline healthy.
+  // -------------------------------------------------------------------------
+  void diag_timer_cb() {
+    const uint64_t rx   = rx_count_        - diag_prev_rx_;
+    const uint64_t pub  = pub_count_       - diag_prev_pub_;
+    const uint64_t d_sz = drop_bad_size_   - diag_prev_drop_size_;
+    const uint64_t d_np = drop_dt_nonpos_  - diag_prev_drop_nonpos_;
+    const uint64_t d_bg = drop_dt_big_     - diag_prev_drop_big_;
+    diag_prev_rx_          = rx_count_;
+    diag_prev_pub_         = pub_count_;
+    diag_prev_drop_size_   = drop_bad_size_;
+    diag_prev_drop_nonpos_ = drop_dt_nonpos_;
+    diag_prev_drop_big_    = drop_dt_big_;
+
+    if (rx == 0) {
+      const auto now_wall = std::chrono::steady_clock::now();
+      if (have_last_chassis_wall_) {
+        const double ago =
+            std::chrono::duration<double>(now_wall - last_chassis_wall_).count();
+        RCLCPP_WARN(get_logger(),
+            "[diag] NO chassis messages in last %.1fs (last one %.1fs ago) — "
+            "sensor stopped, or topic/QoS mismatch; odom cannot update",
+            diag_log_period_sec_, ago);
+      } else {
+        const double since_start =
+            std::chrono::duration<double>(now_wall - node_start_wall_).count();
+        RCLCPP_WARN(get_logger(),
+            "[diag] still NO chassis message %.1fs after node start — "
+            "publisher not up yet, or topic name / QoS mismatch",
+            since_start);
+      }
+      return;
+    }
+
+    RCLCPP_INFO(get_logger(),
+        "[diag] last %.1fs: rx=%llu odom_pub=%llu dropped[bad_size=%llu "
+        "dt<=0=%llu dt>%.2fs=%llu]",
+        diag_log_period_sec_,
+        static_cast<unsigned long long>(rx),
+        static_cast<unsigned long long>(pub),
+        static_cast<unsigned long long>(d_sz),
+        static_cast<unsigned long long>(d_np),
+        max_dt_,
+        static_cast<unsigned long long>(d_bg));
+  }
+
+  // Direct ZYX (yaw-pitch-roll) extraction. NOT Eigen's eulerAngles(2,1,0):
+  // that constrains the first angle to [0, pi] and, for a pure yaw rotation
+  // outside that range, returns the equivalent branch roll=pi/pitch=pi with a
+  // flipped yaw — which corrupts the logged/plotted yaw for |yaw|>90 deg. The
+  // published odom is unaffected (it uses Quaterniond(R_) directly); this only
+  // fixes the diagnostic RPY. atan2 keeps roll,yaw in [-pi,pi], pitch in
+  // [-pi/2,pi/2] with no spurious flips.
   static Eigen::Vector3d R_to_rpy(const Eigen::Matrix3d& R) {
-    const Eigen::Vector3d ea = R.eulerAngles(2, 1, 0);
-    return Eigen::Vector3d(ea[2], ea[1], ea[0]);
+    const double roll  = std::atan2(R(2, 1), R(2, 2));
+    const double pitch = std::atan2(-R(2, 0),
+                                    std::sqrt(R(2, 1) * R(2, 1) + R(2, 2) * R(2, 2)));
+    const double yaw   = std::atan2(R(1, 0), R(0, 0));
+    return Eigen::Vector3d(roll, pitch, yaw);
   }
 
   // --- config / geometry ---
@@ -361,6 +521,7 @@ class WheelOnlyNode : public rclcpp::Node {
   double tilt_kp_{1.0};
   double tilt_accel_band_{0.5};
   double slip_threshold_{0.5};
+  double max_dt_{kDefaultMaxDt};
   bool   flatz_enabled_{true};
   double flatz_alpha_{0.05};
 
@@ -382,6 +543,26 @@ class WheelOnlyNode : public rclcpp::Node {
   // --- timing / diagnostics ---
   double last_t_{-1.0};
   bool   tilt_applied_{false};
+
+  // --- arrival / latency diagnostics ---
+  std::chrono::steady_clock::time_point node_start_wall_{
+      std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point last_chassis_wall_{};
+  bool     have_last_chassis_wall_{false};
+  bool     first_chassis_logged_{false};
+  bool     first_imu_logged_{false};
+  uint64_t rx_count_{0};
+  uint64_t pub_count_{0};
+  uint64_t drop_bad_size_{0};
+  uint64_t drop_dt_nonpos_{0};
+  uint64_t drop_dt_big_{0};
+  uint64_t diag_prev_rx_{0};
+  uint64_t diag_prev_pub_{0};
+  uint64_t diag_prev_drop_size_{0};
+  uint64_t diag_prev_drop_nonpos_{0};
+  uint64_t diag_prev_drop_big_{0};
+  double   diag_log_period_sec_{2.0};
+  rclcpp::TimerBase::SharedPtr diag_timer_;
 
   // --- init window ---
   double init_window_start_{-1.0};

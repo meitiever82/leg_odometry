@@ -32,7 +32,10 @@ install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )
 
-install(PROGRAMS scripts/run_smoke.sh
+install(PROGRAMS
+  scripts/run_smoke.sh
+  scripts/trajectory_plotter.py
+  scripts/dump_wheel_csv.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
