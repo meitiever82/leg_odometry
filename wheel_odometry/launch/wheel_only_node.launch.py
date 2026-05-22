@@ -87,6 +87,20 @@ def _spawn(context, *_):
             }],
             condition=IfCondition(LaunchConfiguration('auto_plot')),
         ),
+        # Optional: dump /wheel_odometry to a TUM file on shutdown, for offline
+        # comparison against a GLIM reference with eval_glim.py.
+        Node(
+            package='wheel_odometry',
+            executable='odom_to_tum.py',
+            name='odom_to_tum',
+            output='screen',
+            parameters=[{
+                'odom_topic':   LaunchConfiguration('odom_topic'),
+                'out_tum':      LaunchConfiguration('tum_path'),
+                'use_sim_time': sim,
+            }],
+            condition=IfCondition(LaunchConfiguration('record_tum')),
+        ),
     ]
 
 
@@ -113,5 +127,10 @@ def generate_launch_description():
             'odom_topic', default_value='/wheel_odometry'),
         DeclareLaunchArgument(
             'trajectory_png', default_value='/tmp/wheel_odom_trajectory.png'),
+        DeclareLaunchArgument(
+            'record_tum', default_value='false',
+            description='Dump /wheel_odometry to a TUM file (tum_path) on shutdown'),
+        DeclareLaunchArgument(
+            'tum_path', default_value='/tmp/wheel_odom.tum'),
         OpaqueFunction(function=_spawn),
     ])

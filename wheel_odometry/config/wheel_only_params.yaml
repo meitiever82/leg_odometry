@@ -7,10 +7,14 @@ wheel_only_odom:
     wheel_radius: 1.0  # in-fact, it is not used
 
     # ---- IMU ----
-    # The 2026-05-14 bag has NO IMU. Leave enable_imu=false unless your bag
-    # has /imu. With enable_imu=false, gyro/Mahony are bypassed and yaw_source
-    # is forced to "ls".
-    enable_imu:      false
+    # enable_imu=true uses the IMU gyro for yaw (yaw_source=gyro below). On this
+    # platform the IMU is mounted ~58 deg tilted, so the node's accel-based mount
+    # calibration (R_base_imu) projects the gyro onto vertical — handled
+    # automatically, no extrinsic config needed. Validated on bag
+    # 2026-05-22-13_58_40: gyro yaw cut APE 10.96 -> 0.34 m vs GLIM.
+    # Set false only for a bag with no IMU (then yaw is forced to LS, ~37%
+    # under-estimated while driving — see project memory).
+    enable_imu:      true
     bias_window_sec: 3.0
     tilt_kp:         1.0
     tilt_accel_band: 0.5
@@ -19,7 +23,9 @@ wheel_only_odom:
     # "ls":   ω_z from the 8×3 LS solve (only valid when enable_imu=false or
     #         when geometry calibration is trusted; drift-free in principle).
     # "gyro": ω_z from IMU after auto-mount calibration (requires enable_imu=true).
-    yaw_source:    "ls"
+    #         Strongly preferred when an IMU is present — pure-wheel LS yaw is
+    #         slip-limited (~0.69 net-ratio while driving); gyro gets ~0.99.
+    yaw_source:    "gyro"
     # Residual is in m/s. /robot/wheel_status.velocity is already m/s on this
     # platform (firmware does ω·r internally), so wheel_radius does not enter
     # the LS — keep slip_threshold an absolute m/s value, ~0.5 is comfortable
@@ -44,7 +50,7 @@ wheel_only_odom:
     base_frame:    "base_link_wheel_odom"
     odom_topic:    "/wheel_odometry"
     chassis_topic: "/robot/wheel_status"
-    imu_topic:     "/imu"
+    imu_topic:     "/rslidar_imu_data"   # IMU embedded in the RS-LiDAR
 
     # Empty string disables CSV logging — leave empty; live PNG is produced
     # by the trajectory_plotter node spawned from the launch file.

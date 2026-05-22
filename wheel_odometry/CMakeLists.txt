@@ -36,6 +36,8 @@ install(PROGRAMS
   scripts/run_smoke.sh
   scripts/trajectory_plotter.py
   scripts/dump_wheel_csv.py
+  scripts/odom_to_tum.py
+  scripts/eval_glim.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
