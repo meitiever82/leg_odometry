@@ -85,6 +85,14 @@ class WheelOnlyNode : public rclcpp::Node {
     // from scripts/calibrate_kappa.py; 0.0 = off. Only used on the LS-yaw path.
     declare_parameter("yaw_kappa",      0.0);
 
+    // ---- LS weighting (|v_i|) ----
+    // Weight each wheel by its speed so a slipping/glitching near-stationary
+    // wheel is down-weighted — single-wheel slip/outlier robustness (estimate
+    // not dragged off, cov better-calibrated). NOT cov inflation for low-speed
+    // singularity (that premise was disproven — see plan §1.7). false → OLS.
+    declare_parameter("weight_by_speed",   true);
+    declare_parameter("wheel_weight_floor", 0.05);  // m/s floor on the weight
+
     // ---- covariance / STILL (ZUPT) ----
     // Diagonal cov for the dims wheels never observe (vz, ωx, ωy): ~∞ info → 0.
     declare_parameter("cov_no_observation", 1.0e6);
@@ -134,6 +142,8 @@ class WheelOnlyNode : public rclcpp::Node {
     yaw_source_     = get_parameter("yaw_source").as_string();
     slip_threshold_ = get_parameter("slip_threshold").as_double();
     yaw_kappa_      = get_parameter("yaw_kappa").as_double();
+    weight_by_speed_= get_parameter("weight_by_speed").as_bool();
+    weight_floor_   = get_parameter("wheel_weight_floor").as_double();
     cov_no_obs_     = get_parameter("cov_no_observation").as_double();
     gyro_yaw_var_   = std::pow(get_parameter("gyro_yaw_sigma").as_double(), 2);
     still_speed_eps_= get_parameter("still_speed_eps").as_double();
@@ -374,7 +384,8 @@ class WheelOnlyNode : public rclcpp::Node {
         msg->velocity[idx_rl_] * wheel_radius_,
         msg->velocity[idx_rr_] * wheel_radius_,
     };
-    const auto sol = wheel_odom::solve_body_twist(angles, speeds, geom_);
+    const auto sol = wheel_odom::solve_body_twist(
+        angles, speeds, geom_, weight_by_speed_, weight_floor_);
 
     // ---- 2. STILL (ZUPT) detection ----
     // Body linear speed from the LS solve, plus (with IMU) the bias-removed gyro
@@ -637,6 +648,8 @@ class WheelOnlyNode : public rclcpp::Node {
   double tilt_accel_band_{0.5};
   double slip_threshold_{0.5};
   double yaw_kappa_{0.0};
+  bool   weight_by_speed_{true};
+  double weight_floor_{0.05};
   double cov_no_obs_{1.0e6};
   double gyro_yaw_var_{1.0e-4};
   double still_speed_eps_{0.02};

@@ -284,21 +284,19 @@ r = A z* − b                 (8×1 residual, 加权前的原始残差)
 **n−p 分母**:OLS unbiased variance 用 n−p,不是 n。p=3 因为我们有 3 个自由参数。8 行解 3 未知 → 5 个 dof 用来估方差。L1 状态下 n=6,dof=3;L2 下 n=4,dof=1(估方差信噪比已经很差,所以 L2 强退 gyro)。
 
 **Σ_z 的几何意义**:
-- **单轮低速**(其它轮在动):该轮 θ 几乎不约束。**加权开(默认)**时 `w_i∝|v_i|→0`,`AᵀWA` 在对应方向退化 → `(AᵀWA)⁻¹` 自动膨胀,cov 如实反映"这一维我不可信"。**加权关**(`mode=none`)时 `(AᵀA)⁻¹` 恒定不膨胀,cov 会**低估**这种角度奇异 —— 这正是 §1.7 把加权设为默认的原因。
+- **单轮低速**(其它轮在动):该轮 θ 不约束,但**另外 3 个好轮已完全确定 twist → 没有真奇异**,小 cov 是对的(实测加权也不膨胀,见 §1.7 的纠正)。只有当该慢轮是**打滑离群**(残差大)时才是问题,靠加权降权 / MAD 处理,不是靠 cov 膨胀。
 - **4 轮全部低速 / 静止**:这不是靠 cov 表达的,而是走 §STILL 状态判定直接出 0 + floor cov + ZUPT 语义。STILL 是并行轨道,先于 L 级判定,不依赖 `Σ_z` 的数值。
 - **几何参数错**(L, W 偏)→ A 错 → ω_z 列的"杠杆"错 → 系统性偏,但残差 r 看不出(其他轮也按错的杠杆走)。这就是 §"为什么 yaw 默认走 gyro" 那一节讲的"残差小不代表 ω_z 对",和 IMU 交叉验证才靠谱。加权也救不了这种**系统性**偏(它只压随机噪声,不识别错杠杆)。
 
-#### 1.7 加权(`wheel_weight_mode=speed`,默认开)
+#### 1.7 加权(`weight_by_speed=true`,默认开)—— 作用是抗打滑离群,**不是** cov 膨胀
 
-**默认实现是按 |v_i| 加权的 WLS**(不是 unweighted OLS)。这不仅是精度优化,更是**让协方差诚实**的必需 —— 见下面的关键论证。
+**默认实现是按 |v_i| 加权的 WLS**:`w_i = max(|v_i|, wheel_weight_floor)`(同一轮 2 行共权,`wheel_weight_floor=0.05 m/s` 防 0)。把 8×3 LS 换成 `W^{1/2} A z = W^{1/2} b`,QR 解;残差 `r=Az−b` 保持**不加权**(仍作 slip 指标 / `slip_threshold` 语义)。`weight_by_speed=false` 退回 OLS。
 
-- **按 |v_i| 加权(默认)**:近静止轮的 θ 测量本身就不约束什么(`v_i·cos θ_i → 0`,该行的 `b` 趋 0 但 `A` 行不变),应当降权;高速轮 SNR 高,应升权。形式上把 8×3 LS 换成 `W^{1/2} A z = W^{1/2} b`,`W=diag(w_i)` 是 8×8 对角,`w_i ∝ |v_i|`(同一轮的 2 行共用一个权,带 floor 防 0)。解仍用 `colPivHouseholderQr` 解加权系统。
-- **IRLS(`wheel_weight_mode=irls`,可选)**:跑一遍 WLS,按残差更新权重(Huber / Cauchy),再跑,直到收敛。比 MAD 硬剔除更平滑,但引入"为什么这个轮被降权"的诊断负担,默认不开。
-- **`wheel_weight_mode=none`**:退回 unweighted OLS,仅用于和加权做对照实验。
-
-> **为什么加权是 cov 正确性的前提(而非可选优化)**:unweighted OLS 下 `A` 只依赖几何,**每帧恒定**,所以 `(AᵀA)⁻¹` 是**常数矩阵**,不随速度变化。于是低速时 `Σ_z=σ²·(AᵀA)⁻¹` 只靠 `σ²=‖r‖²/(n−p)` 缩放,而低速残差小 → `σ²` 小 → **单轮低速的角度奇异被 cov 低估**(详见 §1.6)。
+> **⚠️ 实测纠正(2026-06-12)**:本节早期写「加权让 cov 在低速轮方向膨胀、反映角度奇异」——**这个说法是错的,已证伪**。原因:`Σ_z=σ²·(AᵀWA)⁻¹` 的量级由 `σ²=(rᵀWr)/(n−p)` 主导;数据一致时残差小 → cov 小,**与加权、与速度无关**。更关键:**单个慢轮 + 另外 3 个好轮,twist 被那 3 个轮完全确定,根本没有真奇异**,小 cov 是对的。实测三场景:4 轮干净 → OLS≈WLS;单轮一致低速 → WLS 的 std 反而略**小**(0.2 vs 0.4 mm/s),没膨胀。
 >
-> 加权后系统变成 `Σ_z=σ²·(AᵀWA)⁻¹`,`W` 随 `|v_i|` 变 → `AᵀWA` **每帧都变** → 低速轮自动降权,对应方向的方差**真的膨胀**。这才让"speed≈0 时该轮几乎不约束"这件物理事实被协方差如实表达。所以本设计把加权设为默认,而不是留作可选。
+> **加权真正的作用是离群鲁棒性**:当某慢轮**打滑/抽风**(读数与刚体不一致、残差大)时,OLS 被它带歪(实测 vx 1.0→0.755、cov 还虚高盖不住误差),WLS 把它降权 → 估计回到 0.981、cov 也如实(56mm/s 盖得住 19mm/s 真误差)。**所以加权值得默认开,但定位是"单轮打滑时估计不被毁 + cov 更标定",不是"反映低速奇异"。**
+>
+> 更深的结论(与 §"小 cov ≠ 可靠"一致):**残差型 cov 衡量的是精度(内部自洽),加权改变不了这个本质**——它只让精度估计抗离群。真正的"一致低速奇异"要么不是问题(3 好轮兜底),要么和均匀打滑同属 cov 盲区,任何重加权都救不了。
 
 #### 1.8 与阿克曼(单轨)模型的关系
 
@@ -634,7 +632,7 @@ wheel_only_node.cpp           订阅/发布/参数/失效检测/拼装 quality m
 3. **假设开机前 ≥3s 静止**:估 gyro bias + 初始化 R_base_imu。不静止则 bg 估错,后续每秒进数千度 yaw 漂。STILL 在线 bg EMA 缓解长 run 漂,但救不了初始化
 4. **wheel_to_imu translation 不用**:不影响 ω 测量;真要严格融合时由 ext 的 T_imu_base 补
 5. **wheel_to_imu yaw 部分未约束**:R_base_imu 只对齐 pitch/roll(重力定义);IMU yaw 多/少装 30° 对 ω_z 无影响,但 gx/gy 数值会错。Mahony tilt 每帧拉回重力 → 小 yaw mount 错位被吸收
-6. **角度奇异**:speed ≈ 0 时该轮 angle 几乎不约束 LS(`v_i·cos θ_i → 0`),解算靠其他轮的杠杆。**这要靠 §1.7 的 |v_i| 加权(默认开)才被 cov 如实表达** —— 加权后 `(AᵀWA)⁻¹` 在低速轮方向自动膨胀;若 `wheel_weight_mode=none`(unweighted),`A` 恒定、`(AᵀA)⁻¹` 不膨胀,cov 会低估这种奇异,不要在 none 模式下信任低速段的 cov
+6. **角度奇异(被高估的"问题")**:speed ≈ 0 时该轮 angle 不约束(`v_i·cos θ_i → 0`),解算靠其他轮。实测表明这**不是真问题**:只要另外 3 个轮在动,twist 就被完全确定,小 cov 是对的。`|v_i|` 加权(`weight_by_speed`,默认开)的真正价值是**单轮打滑离群时的鲁棒性**(降权坏轮、估计不被毁),不是"让 cov 反映奇异"(后者已证伪,见 §1.7)。残差型 cov 衡量精度,对系统性/均匀打滑误差一律盲。
 7. **wheel slip 单方向无法甄别**:MAD 检测能识别"一轮异常",但若 4 轮一起均匀打滑(沙地 / 冰面),整体残差不大,vx,vy 会系统性偏 → cov 不会膨胀。重打滑场景需要外部 slip 探测(IMU accel 对比)触发
 
 ---
@@ -694,7 +692,8 @@ bash src/other_odometry/wheel_odometry/scripts/run_smoke.sh
 |---|---|---|
 | **`use_imu`** | **true** | IMU 增强层总开关。`false`=纯轮速平面里程计(不订阅 IMU,yaw 走 LS,roll/pitch≡0);`true`=订阅 IMU,yaw 默认 gyro,加 tilt/ZUPT/bias |
 | `imu_topic` | `/rslidar_imu_data` | `use_imu=true` 时订阅的 IMU topic |
-| `wheel_weight_mode` | `"speed"` | LS 加权:`speed`=按 \|v_i\|(默认,cov 正确性前提)/ `none`=unweighted OLS(仅对照)/ `irls`=迭代重加权 |
+| `weight_by_speed` | `true` | LS 按 \|v_i\| 加权(单轮打滑离群鲁棒性;**非** cov 膨胀,见 §1.7)。`false`=OLS |
+| `wheel_weight_floor` | `0.05` | 加权下限 (m/s),停转轮保留一点票、系统不退化 |
 | `publish_tf` | false | 是否发 `odom→base_link` TF。接 GLIM 必须 false;独立里程计可 true |
 | **`yaw_kappa`** | **0.0** | 轮速 yaw 曲率偏置修正 `ω_z ← ω_z − κ·v_x`(rad/m)。`use_imu=false` 时**必填**(否则 yaw 漂 ~1.9°/s),由 `scripts/calibrate_kappa.py` 按 session 标定;`use_imu=true yaw_source=gyro` 时不用 |
 | `kappa_online` | false | 运动时在线对 gyro 持续估 κ(需 `use_imu=true`);IMU/激光掉线时用最后的 κ 兜住 yaw |

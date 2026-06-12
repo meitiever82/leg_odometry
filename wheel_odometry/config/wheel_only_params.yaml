@@ -39,6 +39,15 @@ wheel_only_odom:
     # margin above observed clean-data residuals (max ~0.14 m/s).
     slip_threshold: 0.1
 
+    # ---- LS weighting (|v_i|) ----
+    # Weight each wheel by its speed so a slipping/glitching near-stationary
+    # wheel is down-weighted → single-wheel slip/outlier robustness (estimate not
+    # dragged off, cov better-calibrated). NOT cov inflation for low-speed
+    # singularity (premise disproven — see plan §1.7). floor is a small m/s vote
+    # a stopped wheel keeps so the solve stays well-posed. false → plain OLS.
+    weight_by_speed:    true
+    wheel_weight_floor: 0.05
+
     # ---- Chassis stream gating ----
     # Max chassis stamp dt (s) the node will still integrate. Larger gaps drop
     # the tick (no odom that cycle). /robot/wheel_status is bursty on this
