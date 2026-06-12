@@ -1,5 +1,8 @@
 # wheel_odometry — 4-Wheel Independent Steering (Swerve) Odometry
 
+> ⚠️ **本 README 是旧版设计,已被 `doc/wheel_odometry_plan.md` 取代,设计以后者为准。**
+> 主要差异:plan.md 改为**分层架构(轮速核心 + IMU 可选,`use_imu` 开关)**、输入用标准 `sensor_msgs/JointState`(非自定义 `ChassisState`)、主输出为 `TwistWithCovarianceStamped`(给 GLIM,带完整 6×6 cov)、默认不发 TF、加 L0–L3+STILL 鲁棒分级与 |v_i| 加权 LS。本 README 描述的单体 `nav_msgs/Odometry`+TF、无 cov、`yaw_source=ls` 默认等均为旧实现。下方 w2 实测表(2026-04-29)仍可作历史参考,但新验证以 plan.md §实测数据 的 2026-06-05 两个 bag 为准。
+
 FK-only 风格的轮式里程计,姊妹包 [`leg_odometry`](../leg_odometry/) 的车轮版。
 
 > 设计依据见 `../leg_odometry/doc/fk_only_odometry.md` —— 同一套架构(IMU 给姿态、轮子 FK 给身体速度、无 Kalman),只把腿 FK 模块换成 4 轮 swerve 最小二乘解算。

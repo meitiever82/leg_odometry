@@ -5,6 +5,11 @@
  * State:    p ∈ R³, R ∈ SO(3), gyro_bias ∈ R³.
  * Pipeline (driven by /robot/wheel_status, sensor_msgs/JointState):
  *   1. solve LS:                     (vx_b, vy_b, ω_z_LS, residual)
+ *   1b. yaw-bias correction:         ω_z ← ω_z_LS − yaw_kappa · vx_b
+ *                                    (κ from calibrate_kappa.py; removes the
+ *                                    speed-proportional steering/scale bias that
+ *                                    otherwise drifts wheel yaw ~1.9°/s. Applied
+ *                                    only on the LS-yaw path, not the gyro path.)
  *   2. propagate R:                  yaw_source ∈ {ls, gyro}
  *                                    R ← R · exp_so3((ω_used) · dt)
  *   3. accel-tilt Mahony (gated):    pulls R's roll/pitch toward gravity,
@@ -65,9 +70,9 @@ int find_wheel(const std::vector<std::string>& names, const char* key) {
 class WheelOnlyNode : public rclcpp::Node {
  public:
   WheelOnlyNode() : Node("wheel_only_odom") {
-    declare_parameter("wheelbase",   0.6);
-    declare_parameter("track",       0.5);
-    declare_parameter("wheel_radius", 1.0);
+    declare_parameter("wheelbase",   0.435);   // w2 measured (was 0.6 placeholder)
+    declare_parameter("track",       0.400);   // w2 measured (was 0.5 placeholder)
+    declare_parameter("wheel_radius", 1.0);    // w2 speed field is already m/s
 
     declare_parameter("bias_window_sec", 3.0);
     declare_parameter("tilt_kp",         1.0);
@@ -75,6 +80,31 @@ class WheelOnlyNode : public rclcpp::Node {
 
     declare_parameter("yaw_source",     std::string("ls"));
     declare_parameter("slip_threshold", 0.5);
+    // Curvature-bias correction (rad/m): ω_z ← ω_z_LS − yaw_kappa·vx_b. Removes
+    // the speed-proportional wheel-yaw drift (~1.9°/s on w2). Per-session value
+    // from scripts/calibrate_kappa.py; 0.0 = off. Only used on the LS-yaw path.
+    declare_parameter("yaw_kappa",      0.0);
+
+    // ---- covariance / STILL (ZUPT) ----
+    // Diagonal cov for the dims wheels never observe (vz, ωx, ωy): ~∞ info → 0.
+    declare_parameter("cov_no_observation", 1.0e6);
+    // ωz noise std on the gyro-yaw path (rad/s); its variance replaces the LS
+    // analytic ωz variance when yaw_source=gyro.
+    declare_parameter("gyro_yaw_sigma",     0.01);
+    // STILL (zero-velocity) detection thresholds.
+    declare_parameter("still_speed_eps",    0.02);   // body speed (m/s)
+    declare_parameter("still_gyro_eps",     0.02);   // ‖gyro−bg‖ (rad/s), imu only
+    // Floor cov when STILL: wheels assert all 6 dims are 0 (not "unobserved").
+    declare_parameter("floor_sigma_v",      0.005);  // m/s
+    declare_parameter("floor_sigma_omega",  0.001);  // rad/s
+    // Mirror the twist (vx,vy,ωz) variance into pose.covariance so rviz's
+    // Odometry "Covariance" display can render it (x/y ellipse + yaw cone). This
+    // is a VISUALISATION proxy (velocity variance shown as if it were pose
+    // variance); when on, pose.cov no longer carries the residual/is_still
+    // diagnostics (the trajectory_plotter residual subplot then reads ~0 — use
+    // the CSV's ls_residual column instead). Default off.
+    declare_parameter("mirror_twist_cov_to_pose", false);
+
     // Max chassis stamp dt (s) still integrated; larger gaps drop the tick.
     declare_parameter("max_dt",         kDefaultMaxDt);
 
@@ -103,6 +133,14 @@ class WheelOnlyNode : public rclcpp::Node {
     tilt_accel_band_= get_parameter("tilt_accel_band").as_double();
     yaw_source_     = get_parameter("yaw_source").as_string();
     slip_threshold_ = get_parameter("slip_threshold").as_double();
+    yaw_kappa_      = get_parameter("yaw_kappa").as_double();
+    cov_no_obs_     = get_parameter("cov_no_observation").as_double();
+    gyro_yaw_var_   = std::pow(get_parameter("gyro_yaw_sigma").as_double(), 2);
+    still_speed_eps_= get_parameter("still_speed_eps").as_double();
+    still_gyro_eps_ = get_parameter("still_gyro_eps").as_double();
+    floor_v2_       = std::pow(get_parameter("floor_sigma_v").as_double(), 2);
+    floor_w2_       = std::pow(get_parameter("floor_sigma_omega").as_double(), 2);
+    mirror_cov_     = get_parameter("mirror_twist_cov_to_pose").as_bool();
     max_dt_         = get_parameter("max_dt").as_double();
     flatz_enabled_  = get_parameter("flatz_enabled").as_bool();
     flatz_alpha_    = get_parameter("flatz_alpha").as_double();
@@ -134,7 +172,7 @@ class WheelOnlyNode : public rclcpp::Node {
       if (diag_fp_) {
         std::fprintf(diag_fp_,
             "t_abs,x,y,z,roll,pitch,yaw,vx_w,vy_w,vz_w,vx_b,vy_b,"
-            "wz_ls,wz_used,ls_residual,tilt_applied,used_ls_yaw\n");
+            "wz_ls,wz_used,ls_residual,tilt_applied,used_ls_yaw,is_still\n");
       }
     }
 
@@ -167,11 +205,12 @@ class WheelOnlyNode : public rclcpp::Node {
     bg_.setZero();
 
     RCLCPP_INFO(get_logger(),
-        "wheel_only_odom: L=%.3f W=%.3f imu=%s yaw_source=%s "
+        "wheel_only_odom: L=%.3f W=%.3f imu=%s yaw_source=%s κ=%.4f "
         "slip_thr=%.3f  max_dt=%.2f  flatz=%s α=%.3f  chassis=%s odom=%s",
         get_parameter("wheelbase").as_double(),
         get_parameter("track").as_double(),
-        enable_imu_ ? "on" : "off", yaw_source_.c_str(), slip_threshold_,
+        enable_imu_ ? "on" : "off", yaw_source_.c_str(), yaw_kappa_,
+        slip_threshold_,
         max_dt_,
         flatz_enabled_ ? "on" : "off", flatz_alpha_,
         chassis_topic.c_str(), odom_topic.c_str());
@@ -337,16 +376,37 @@ class WheelOnlyNode : public rclcpp::Node {
     };
     const auto sol = wheel_odom::solve_body_twist(angles, speeds, geom_);
 
-    // ---- 2. choose ω_used and propagate R ----
+    // ---- 2. STILL (ZUPT) detection ----
+    // Body linear speed from the LS solve, plus (with IMU) the bias-removed gyro
+    // magnitude. When still, wheels assert ALL six dims are exactly zero — a
+    // high-value zero-velocity constraint for the downstream factor graph.
+    const double body_speed = std::hypot(sol.vx, sol.vy);
+    bool is_still = (body_speed < still_speed_eps_);
+    if (enable_imu_ && has_accel_) {
+      is_still = is_still && (last_gyro_.norm() < still_gyro_eps_);
+    }
+
+    // ---- 2b. choose ω_used + decide the published ωz covariance ----
     const bool can_use_ls_yaw =
         (yaw_source_ == "ls") && (sol.residual < slip_threshold_);
     Eigen::Vector3d omega_used = last_gyro_;  // zero if !enable_imu_
+    double omega_z_var;              // variance for the published ωz
+    bool   keep_yaw_cross = false;   // keep vx/vy ↔ ωz cross-cov (LS-yaw only)
     if (can_use_ls_yaw) {
-      omega_used.z() = sol.omega_z;
-    } else if (yaw_source_ == "ls") {
+      // κ-corrected LS yaw: subtract the speed-proportional curvature bias.
+      omega_used.z() = sol.omega_z - yaw_kappa_ * sol.vx;
+      omega_z_var    = sol.cov(2, 2);
+      keep_yaw_cross = true;
+    } else if (yaw_source_ == "gyro") {
+      omega_z_var = gyro_yaw_var_;   // gyro spec; independent of the wheel LS
+    } else {
       // residual gated us out — keep yaw frozen this tick rather than rolling
-      // back to a stale gyro that may also be zero.
+      // back to a stale gyro that may also be zero; mark it as untrusted.
       omega_used.z() = 0.0;
+      omega_z_var    = cov_no_obs_;
+    }
+    if (is_still) {
+      omega_used.setZero();          // freeze attitude when stopped
     }
     if (init_done_) {
       R_ = R_ * wheel_odom::exp_so3(omega_used * dt);
@@ -366,8 +426,9 @@ class WheelOnlyNode : public rclcpp::Node {
       }
     }
 
-    // ---- 4. body → world velocity ----
-    const Eigen::Vector3d v_body(sol.vx, sol.vy, 0.0);
+    // ---- 4. body → world velocity (zeroed when STILL) ----
+    const Eigen::Vector3d v_body =
+        is_still ? Eigen::Vector3d::Zero() : Eigen::Vector3d(sol.vx, sol.vy, 0.0);
     const Eigen::Vector3d v_world = R_ * v_body;
 
     // ---- 5. integrate position ----
@@ -378,28 +439,63 @@ class WheelOnlyNode : public rclcpp::Node {
       p_.z() = (1.0 - flatz_alpha_) * p_.z();
     }
 
+    // ---- build the 6×6 twist covariance (order: vx,vy,vz,ωx,ωy,ωz) ----
+    const std::array<double, 36> tw_cov =
+        make_twist_cov(sol.cov, omega_z_var, keep_yaw_cross, is_still);
+
     if (diag_fp_) {
       const auto rpy = R_to_rpy(R_);
       std::fprintf(diag_fp_,
           "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
           "%.6f,%.6f,%.6f,%.6f,%.6f,"
-          "%.6f,%.6f,%.6f,%d,%d\n",
+          "%.6f,%.6f,%.6f,%d,%d,%d\n",
           t_abs, p_.x(), p_.y(), p_.z(),
           rpy[0], rpy[1], rpy[2],
           v_world.x(), v_world.y(), v_world.z(), v_body.x(), v_body.y(),
           sol.omega_z, omega_used.z(), sol.residual,
           static_cast<int>(tilt_applied_),
-          static_cast<int>(can_use_ls_yaw));
+          static_cast<int>(can_use_ls_yaw),
+          static_cast<int>(is_still));
     }
 
-    publish(msg->header.stamp, v_body, omega_used, sol.residual);
+    publish(msg->header.stamp, v_body, omega_used, sol.residual, tw_cov, is_still);
     ++pub_count_;
+  }
+
+  // Map the 3×3 LS solution cov (vx,vy,ωz) into a published 6×6 twist cov in the
+  // (vx,vy,vz,ωx,ωy,ωz) order. STILL → floor on all six (wheels assert zero);
+  // otherwise vx/vy from the LS, ωz per the yaw-source policy, and the three
+  // never-observed dims (vz,ωx,ωy) get ~∞ variance to tell GLIM to ignore them.
+  std::array<double, 36> make_twist_cov(const Eigen::Matrix3d& Sz,
+                                        double omega_z_var, bool keep_cross,
+                                        bool still) const {
+    std::array<double, 36> C{};  // zero-initialised
+    auto at = [&C](int r, int c) -> double& { return C[r * 6 + c]; };
+    if (still) {
+      at(0, 0) = floor_v2_; at(1, 1) = floor_v2_; at(2, 2) = floor_v2_;
+      at(3, 3) = floor_w2_; at(4, 4) = floor_w2_; at(5, 5) = floor_w2_;
+      return C;
+    }
+    // observed: vx, vy (LS 2×2 block)
+    at(0, 0) = Sz(0, 0); at(0, 1) = Sz(0, 1);
+    at(1, 0) = Sz(1, 0); at(1, 1) = Sz(1, 1);
+    // observed: ωz
+    at(5, 5) = omega_z_var;
+    if (keep_cross) {  // LS-yaw: keep vx/vy ↔ ωz cross terms
+      at(0, 5) = Sz(0, 2); at(5, 0) = Sz(2, 0);
+      at(1, 5) = Sz(1, 2); at(5, 1) = Sz(2, 1);
+    }
+    // never observed by wheels: vz, ωx, ωy
+    at(2, 2) = cov_no_obs_; at(3, 3) = cov_no_obs_; at(4, 4) = cov_no_obs_;
+    return C;
   }
 
   void publish(const builtin_interfaces::msg::Time& stamp,
                const Eigen::Vector3d& v_body,
                const Eigen::Vector3d& omega_used,
-               double ls_residual) {
+               double ls_residual,
+               const std::array<double, 36>& twist_cov,
+               bool is_still) {
     Eigen::Quaterniond q(R_);
     q.normalize();
 
@@ -422,11 +518,30 @@ class WheelOnlyNode : public rclcpp::Node {
     odom.twist.twist.angular.x  = omega_used.x();
     odom.twist.twist.angular.y  = omega_used.y();
     odom.twist.twist.angular.z  = omega_used.z();
-    // Squat covariance[0] as a diagnostic channel: LS residual (m/s).
-    // Consumers that read covariance for real uncertainty should ignore this
-    // node; covariance[0]<0 would mark "unknown". The trajectory_plotter
-    // reads this slot to render the residual time series.
-    odom.twist.covariance[0]    = ls_residual;
+    // Real 6×6 twist covariance (vx,vy,vz,ωx,ωy,ωz) — first-class output for the
+    // downstream GLIM factor graph (see make_twist_cov / plan §Covariance).
+    for (size_t i = 0; i < 36; ++i) odom.twist.covariance[i] = twist_cov[i];
+
+    if (mirror_cov_) {
+      // Mirror velocity uncertainty into pose.cov so rviz's Odometry
+      // "Covariance" display renders it: (x,y) ellipse from (vx,vy), yaw cone
+      // from ωz. pose order (x,y,z,roll,pitch,yaw); twist (vx,vy,vz,ωx,ωy,ωz).
+      // Proxy viz only (var is m²/s² shown as if m²); enlarge with the display's
+      // Position-Covariance "Scale". z,roll,pitch get a tiny floor so the
+      // ellipsoid/cone is well-formed (and flat in the ground plane).
+      auto& P = odom.pose.covariance;
+      P[0]  = twist_cov[0];  P[1]  = twist_cov[1];   // x-x, x-y  <- vx
+      P[6]  = twist_cov[6];  P[7]  = twist_cov[7];   // y-x, y-y  <- vy
+      P[5]  = twist_cov[5];  P[30] = twist_cov[30];  // x-yaw     <- vx-ωz
+      P[11] = twist_cov[11]; P[31] = twist_cov[31];  // y-yaw     <- vy-ωz
+      P[35] = twist_cov[35];                         // yaw-yaw   <- ωz
+      P[14] = 1.0e-6; P[21] = 1.0e-6; P[28] = 1.0e-6;  // z, roll, pitch floor
+    } else {
+      // Diagnostics ride in the (GLIM-unused) pose covariance: [0]=LS residual
+      // (m/s), [7]=is_still flag. The trajectory_plotter reads pose.cov[0].
+      odom.pose.covariance[0]   = ls_residual;
+      odom.pose.covariance[7]   = is_still ? 1.0 : 0.0;
+    }
     odom_pub_->publish(odom);
 
     if (publish_tf_) {
@@ -521,6 +636,14 @@ class WheelOnlyNode : public rclcpp::Node {
   double tilt_kp_{1.0};
   double tilt_accel_band_{0.5};
   double slip_threshold_{0.5};
+  double yaw_kappa_{0.0};
+  double cov_no_obs_{1.0e6};
+  double gyro_yaw_var_{1.0e-4};
+  double still_speed_eps_{0.02};
+  double still_gyro_eps_{0.02};
+  double floor_v2_{2.5e-5};
+  double floor_w2_{1.0e-6};
+  bool   mirror_cov_{false};
   double max_dt_{kDefaultMaxDt};
   bool   flatz_enabled_{true};
   double flatz_alpha_{0.05};

@@ -14,7 +14,7 @@ wheel_only_odom:
     # 2026-05-22-13_58_40: gyro yaw cut APE 10.96 -> 0.34 m vs GLIM.
     # Set false only for a bag with no IMU (then yaw is forced to LS, ~37%
     # under-estimated while driving — see project memory).
-    enable_imu:      true
+    enable_imu:      false
     bias_window_sec: 3.0
     tilt_kp:         1.0
     tilt_accel_band: 0.5
@@ -25,7 +25,14 @@ wheel_only_odom:
     # "gyro": ω_z from IMU after auto-mount calibration (requires enable_imu=true).
     #         Strongly preferred when an IMU is present — pure-wheel LS yaw is
     #         slip-limited (~0.69 net-ratio while driving); gyro gets ~0.99.
-    yaw_source:    "gyro"
+    yaw_source:    "ls"
+    # Curvature-bias correction for the LS-yaw path: ω_z ← ω_z_LS − yaw_kappa·vx
+    # (rad/m). Removes the speed-proportional steering/scale bias that otherwise
+    # drifts pure-wheel yaw ~1.9°/s. ONLY used when yaw_source="ls" (enable_imu=
+    # false); ignored on the gyro path. 0.0 = off. Per-session value from
+    # scripts/calibrate_kappa.py — w2 ≈ -0.0358 (drifts ~24% over 2 weeks, so
+    # re-calibrate per session). Validated: heading drift 1.9 → 0.07 °/s.
+    yaw_kappa:     -0.0358
     # Residual is in m/s. /robot/wheel_status.velocity is already m/s on this
     # platform (firmware does ω·r internally), so wheel_radius does not enter
     # the LS — keep slip_threshold an absolute m/s value, ~0.5 is comfortable
@@ -46,6 +53,15 @@ wheel_only_odom:
 
     # ---- ROS output ----
     publish_tf:    true
+    # Mirror the twist (vx,vy,ωz) variance into pose.covariance so rviz's
+    # Odometry "Covariance" display can draw it (x/y ellipse + yaw cone). It's a
+    # visualisation proxy — the ellipse grows/shrinks with the velocity
+    # uncertainty (small on clean data → enlarge with the display's Position
+    # Covariance "Scale"; balloons when yaw is slip-gated). NOTE: with this on,
+    # pose.cov no longer carries the residual/is_still diagnostics, so the
+    # trajectory_plotter's residual subplot reads ~0 — read ls_residual from the
+    # diag CSV instead (or set auto_plot:=false / this back to false).
+    mirror_twist_cov_to_pose: true
     odom_frame:    "odom"
     base_frame:    "base_link_wheel_odom"
     odom_topic:    "/wheel_odometry"

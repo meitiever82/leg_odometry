@@ -75,8 +75,10 @@ class TrajectoryPlotter(Node):
         self.vx.append(msg.twist.twist.linear.x)
         self.vy.append(msg.twist.twist.linear.y)
         self.wz.append(msg.twist.twist.angular.z)
-        # wheel_only_node squats twist.covariance[0] with LS residual (m/s).
-        self.res.append(float(msg.twist.covariance[0]))
+        # wheel_only_node now publishes a real 6x6 twist.covariance; the LS
+        # residual diagnostic moved to pose.covariance[0] (pose cov is otherwise
+        # unused — GLIM consumes only the twist). pose.covariance[7] = is_still.
+        self.res.append(float(msg.pose.covariance[0]))
 
     def save_plot(self):
         n = len(self.t)

@@ -57,13 +57,29 @@ def _spawn(context, *_):
     # while the Odometry display lags. Same clock everywhere = no lag.
     sim = ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)
 
+    # Optional yaw-mode overrides. The YAML (params_file) is the single source of
+    # truth; a launch arg is applied ON TOP of it ONLY when explicitly passed
+    # (empty default = "leave the YAML value alone"). This avoids silently
+    # clobbering the YAML. For pure-wheel mode:
+    #   ros2 launch ... enable_imu:=false yaw_source:=ls yaw_kappa:=-0.0358
+    overrides = {'use_sim_time': sim}
+    ei = LaunchConfiguration('enable_imu').perform(context)
+    if ei != '':
+        overrides['enable_imu'] = (ei.lower() in ('1', 'true', 'yes'))
+    ys = LaunchConfiguration('yaw_source').perform(context)
+    if ys != '':
+        overrides['yaw_source'] = ys
+    yk = LaunchConfiguration('yaw_kappa').perform(context)
+    if yk != '':
+        overrides['yaw_kappa'] = float(yk)
+
     return [
         Node(
             package='wheel_odometry',
             executable='wheel_only_node',
             name='wheel_only_odom',
             output='screen',
-            parameters=[params_file, {'use_sim_time': sim}],
+            parameters=[params_file, overrides],
         ),
         Node(
             package='rviz2',
@@ -118,6 +134,18 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'use_sim_time', default_value='false',
             description='Set true when replaying a bag with `ros2 bag play --clock`'),
+        # Yaw-mode overrides. Empty = use the YAML value (single source of truth);
+        # pass a value only to override it for this run. For pure-wheel odometry:
+        #   enable_imu:=false yaw_source:=ls yaw_kappa:=-0.0358
+        DeclareLaunchArgument(
+            'enable_imu', default_value='',
+            description='Override YAML: true/false. Empty = use YAML. false = pure wheel.'),
+        DeclareLaunchArgument(
+            'yaw_source', default_value='',
+            description='Override YAML: "gyro" or "ls". Empty = use YAML.'),
+        DeclareLaunchArgument(
+            'yaw_kappa', default_value='',
+            description='Override YAML curvature-bias (rad/m); w2 ~ -0.0358. Empty = use YAML.'),
         DeclareLaunchArgument(
             'rviz_config', default_value=default_rviz),
         DeclareLaunchArgument(

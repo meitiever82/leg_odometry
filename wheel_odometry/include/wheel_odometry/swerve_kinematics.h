@@ -42,6 +42,14 @@ struct SwerveSolution {
   double vy;            // body-frame linear velocity y (m/s)
   double omega_z;       // yaw rate (rad/s)
   double residual;      // ||A z - b||₂ over 8 equations (m/s)
+  // Analytic OLS covariance of z=(vx,vy,ωz): Σ = σ²·(AᵀA)⁻¹, with the unbiased
+  // variance σ² = ||r||²/(n−p), n=8, p=3. Full 3×3 incl. vx/vy/ωz cross terms;
+  // the downstream node maps it into the published twist covariance. NOTE: this
+  // is the UNWEIGHTED OLS cov (matches the unweighted solve). The |v_i|-weighted
+  // form (plan §1.7) — which makes the cov inflate for a near-stationary single
+  // wheel — is a future refinement; with W=I the low-speed angle-singularity is
+  // not reflected here.
+  Eigen::Matrix3d cov;
 };
 
 inline SwerveSolution solve_body_twist(
@@ -61,7 +69,14 @@ inline SwerveSolution solve_body_twist(
   }
   const Eigen::Vector3d z = A.colPivHouseholderQr().solve(b);
   const double residual = (A * z - b).norm();
-  return SwerveSolution{ z(0), z(1), z(2), residual };
+
+  // OLS covariance: σ² = SSE/(n−p), Σ = σ²·(AᵀA)⁻¹.  (AᵀA is constant geometry;
+  // recomputed here for locality — it is a cheap 3×3.)
+  constexpr int n = 8, p = 3;
+  const double sigma2 = (residual * residual) / static_cast<double>(n - p);
+  const Eigen::Matrix3d cov = sigma2 * (A.transpose() * A).inverse();
+
+  return SwerveSolution{ z(0), z(1), z(2), residual, cov };
 }
 
 }  // namespace wheel_odom
