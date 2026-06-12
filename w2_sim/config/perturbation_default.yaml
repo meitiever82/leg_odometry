@@ -1,0 +1,9 @@
+steer_bias_max_deg: 0.5
+speed_scale_std: 0.005
+steer_noise_std_deg: 0.05
+speed_noise_std: 0.01
+gyro_bias_init_max_dps: 0.5
+gyro_rw_std: 5.0e-5
+gyro_noise_density_dps_sqrthz: 0.01
+accel_noise_density_mg_sqrthz: 0.1
+imu_rate_hz: 200.0
