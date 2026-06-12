@@ -1,0 +1,102 @@
+<?xml version="1.0"?>
+<!-- w2 swerve 底盘 overlay:include SolidWorks 上身导出 + 4 个转向/驱动模组 + 传感器帧。
+     与 w2/urdf/W2EVT1Urdf_with_wheels.urdf.xacro(纯视觉,固定朝向轮)互不影响。
+     生成流程见 scripts/build_urdf.py(xacro 展开后还要锁上身、改 mesh 路径)。 -->
+<robot name="W2EVT1Urdf_swerve" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:include filename="$(env HOME)/rtabmap_ws/w2/urdf/W2EVT1Urdf.SLDASM.urdf"/>
+
+  <!-- 实测底盘几何(2026-05-13,见 _with_wheels.urdf.xacro 注释) -->
+  <xacro:property name="wheel_radius"   value="0.075"/>
+  <xacro:property name="wheel_width"    value="0.034"/>
+  <xacro:property name="wheel_mass"     value="0.5"/>
+  <xacro:property name="steer_mass"     value="0.3"/>
+  <xacro:property name="track_width"    value="0.400"/>
+  <xacro:property name="wheelbase"      value="0.435"/>
+  <xacro:property name="wheel_z_offset" value="-0.14"/>
+
+  <link name="base_footprint"/>
+  <joint name="base_footprint_to_base_link" type="fixed">
+    <parent link="base_footprint"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 ${wheel_radius - wheel_z_offset}" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:macro name="swerve_module" params="prefix x y">
+    <link name="${prefix}_steer_link">
+      <inertial>
+        <mass value="${steer_mass}"/>
+        <origin xyz="0 0 0"/>
+        <inertia ixx="2e-4" iyy="2e-4" izz="2e-4" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual>
+        <geometry><cylinder length="0.04" radius="0.02"/></geometry>
+      </visual>
+    </link>
+    <joint name="${prefix}_steer_joint" type="revolute">
+      <parent link="base_link"/>
+      <child  link="${prefix}_steer_link"/>
+      <origin xyz="${x} ${y} ${wheel_z_offset}" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${-pi}" upper="${pi}" effort="50" velocity="12"/>
+      <dynamics damping="0.1" friction="0.0"/>
+    </joint>
+
+    <link name="${prefix}_wheel_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder length="${wheel_width}" radius="${wheel_radius}"/></geometry>
+        <material name="wheel_dark"><color rgba="0.1 0.1 0.1 1.0"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder length="${wheel_width}" radius="${wheel_radius}"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="${wheel_mass}"/>
+        <origin xyz="0 0 0"/>
+        <inertia
+          ixx="${wheel_mass*(3*wheel_radius*wheel_radius + wheel_width*wheel_width)/12}"
+          iyy="${wheel_mass*wheel_radius*wheel_radius/2}"
+          izz="${wheel_mass*(3*wheel_radius*wheel_radius + wheel_width*wheel_width)/12}"
+          ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}_wheel_joint" type="continuous">
+      <parent link="${prefix}_steer_link"/>
+      <child  link="${prefix}_wheel_link"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <dynamics damping="0.01" friction="0.0"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:swerve_module prefix="front_left"  x="${ wheelbase/2}" y="${ track_width/2}"/>
+  <xacro:swerve_module prefix="front_right" x="${ wheelbase/2}" y="${-track_width/2}"/>
+  <xacro:swerve_module prefix="rear_left"   x="${-wheelbase/2}" y="${ track_width/2}"/>
+  <xacro:swerve_module prefix="rear_right"  x="${-wheelbase/2}" y="${-track_width/2}"/>
+
+  <!-- 传感器帧。倾角为近似值(design §4:精确外参非本期关键);
+       Task 11 验证步骤会用实车静止段重力方向校核倾角符号。 -->
+  <link name="rslidar"/>
+  <joint name="base_link_to_rslidar" type="fixed">
+    <parent link="base_link"/>
+    <child  link="rslidar"/>
+    <origin xyz="0.25 0 0.55" rpy="0 1.01 0"/>  <!-- pitch ~58° 前倾(近似) -->
+  </joint>
+
+  <link name="imu_link"/>
+  <joint name="rslidar_to_imu_link" type="fixed">
+    <parent link="rslidar"/>
+    <child  link="imu_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="camera_link"/>
+  <joint name="base_link_to_camera" type="fixed">
+    <parent link="base_link"/>
+    <child  link="camera_link"/>
+    <origin xyz="0.30 0 0.50" rpy="0 0 0"/>
+  </joint>
+
+</robot>
