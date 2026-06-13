@@ -57,7 +57,7 @@ from isaacsim.core.utils.stage import (  # noqa: E402
 
 enable_extension("isaacsim.asset.importer.urdf")
 from isaacsim.asset.importer.urdf import _urdf  # noqa: E402
-from pxr import Sdf, Usd, UsdPhysics  # noqa: E402
+from pxr import Sdf, UsdPhysics  # noqa: E402
 
 urdf_path = os.path.abspath(os.path.expanduser(sys.argv[1]))
 usd_path = os.path.abspath(os.path.expanduser(sys.argv[2]))
@@ -88,18 +88,20 @@ create_new_stage()
 status, robot_model = omni.kit.commands.execute(
     "URDFParseFile", urdf_path=urdf_path, import_config=cfg)
 assert status, "URDFParseFile 失败"
-res = omni.kit.commands.execute(
+ok, _result = omni.kit.commands.execute(
     "URDFImportRobot",
     urdf_robot=robot_model,
     import_config=cfg,
     urdf_path=urdf_path,
     dest_path="",  # 空 → 导入当前 stage,不拆多层文件
 )
-print("IMPORT_RES:", res, flush=True)
+assert ok, f"URDFImportRobot 失败,res={_result}"
+print("IMPORT_RES:", _result, flush=True)
 
 stage = get_current_stage()
 layer = stage.GetRootLayer()
 root_prim = stage.GetDefaultPrim()
+assert root_prim, "importer 未设置 defaultPrim(make_default_prim 未生效?)"
 root_path = str(root_prim.GetPath())
 print("ROOT_PRIM:", root_path, flush=True)
 
@@ -145,8 +147,7 @@ for dst_path, src_path in work:
         continue
     src_prim = stage.GetPrimAtPath(src_path)
     if not src_prim or not layer.GetPrimAtPath(src_path):
-        # src scope 可能已被同名 link 的另一个 ref 消费(visuals/collisions 共指);
-        # 用 stage 上的子 prim 列表拷贝,缺失则跳过(几何仍在源 scope,后面不删该 scope 前已拷)。
+        # src scope 此路径不在 layer 里(importer 结构异常),跳过——末尾 assert 会捕获漏拷的情况。
         continue
     for child in src_prim.GetChildren():
         dst_child = Sdf.Path(dst_path + "/" + child.GetName())
@@ -180,6 +181,7 @@ for scope in GEOM_SCOPES:
 # 删除 importer 默认相机等非机器人 prim(导出只要 defaultPrim 子树,但顶层杂项一并清掉)。
 for c in list(stage.GetPseudoRoot().GetChildren()):
     cp = str(c.GetPath())
+    # Omniverse Kit 5.1.x 默认视口 prim;版本升级后如有新名称在此追加
     if cp != root_path and c.GetName() in (
         "Render", "OmniverseKit_Persp", "OmniverseKit_Front",
         "OmniverseKit_Top", "OmniverseKit_Right",

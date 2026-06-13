@@ -56,8 +56,11 @@ from w2_sim.swerve_kinematics import WHEEL_NAMES, WHEEL_RADIUS, inverse_kinemati
 from w2_sim.trajectory_generator import generate_profile  # noqa: E402
 
 PHYS_HZ, CMD_HZ = 200.0, 50.0
+RENDER_HZ = 30.0
+CAMERA_FOCAL_LENGTH_MM = 18.0  # ~50° HFoV(aperture 默认 20.955mm),近似前视相机
+
 world = World(stage_units_in_meters=1.0,
-              physics_dt=1.0 / PHYS_HZ, rendering_dt=1.0 / 30.0)
+              physics_dt=1.0 / PHYS_HZ, rendering_dt=1.0 / RENDER_HZ)
 
 # ---- 场景 ----
 if args.env == "warehouse":
@@ -67,7 +70,7 @@ if args.env == "warehouse":
             usd_path=assets + "/Isaac/Environments/Simple_Warehouse/warehouse.usd",
             prim_path="/World/env")
     else:
-        print("WARN: 云资产不可达,退回平地", flush=True)
+        print("WARN: 云资产不可达,退回平地", file=sys.stderr, flush=True)
         world.scene.add_default_ground_plane()
 else:
     world.scene.add_default_ground_plane()
@@ -85,6 +88,8 @@ root_candidates = [
 ]
 print("ARTICULATION_ROOT_CANDIDATES:", root_candidates, flush=True)
 assert root_candidates, "stage 里没有带 ArticulationRootAPI 的 prim(USD 缺 articulation root)"
+assert len(root_candidates) == 1, \
+    f"发现多个 ArticulationRootAPI: {root_candidates},预期只有 1 个"
 ROBOT_ROOT = root_candidates[0]
 print("ROBOT_ROOT:", ROBOT_ROOT, flush=True)
 
@@ -122,7 +127,7 @@ lidar_rp = rep.create.render_product(lidar_prim.GetPath(), [1, 1])
 
 # ---- 前视相机(挂 camera_link)----
 cam = UsdGeom.Camera.Define(get_current_stage(), CAMERA_LINK + "/front_camera")
-cam.GetFocalLengthAttr().Set(18.0)
+cam.GetFocalLengthAttr().Set(CAMERA_FOCAL_LENGTH_MM)
 cam_rp = rep.create.render_product(CAMERA_LINK + "/front_camera", (640, 480))
 
 # ===========================================================================
@@ -253,6 +258,9 @@ robot.initialize()  # 显式初始化,确保 dof_names 可用
 # 驱动增益:steer 位置驱动,wheel 速度驱动
 dof = {n: i for i, n in enumerate(robot.dof_names)}
 print("DOF_NAMES:", robot.dof_names, flush=True)
+missing = [f"{w}_steer_joint" for w in WHEEL_NAMES if f"{w}_steer_joint" not in dof]
+missing += [f"{w}_wheel_joint" for w in WHEEL_NAMES if f"{w}_wheel_joint" not in dof]
+assert not missing, f"关节名不匹配,缺: {missing}\n实际 DOF: {list(dof)}"
 steer_idx = [dof[f"{w}_steer_joint"] for w in WHEEL_NAMES]
 wheel_idx = [dof[f"{w}_wheel_joint"] for w in WHEEL_NAMES]
 ndof = len(robot.dof_names)
