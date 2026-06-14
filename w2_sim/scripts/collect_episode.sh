@@ -17,8 +17,21 @@ set -u
 # RMW:统一默认 FastDDS(本机 jazzy 无 cyclonedds),不要 export RMW_IMPLEMENTATION
 : "${ISAACSIM_DIR:?需要 export ISAACSIM_DIR}"
 
-cleanup() { kill $(jobs -p) 2>/dev/null || true; }
+# 退出清理:kill jobs 只杀 `ros2 run` wrapper,会留下子进程 degradation_node 孤儿
+# (它会污染下一次采集),所以再按进程名补杀一遍。
+cleanup() {
+  kill $(jobs -p) 2>/dev/null || true
+  pkill -9 -f "w2_sim.degradation_node" 2>/dev/null || true
+  pkill -9 -f "isaac/w2_sim_app.py"     2>/dev/null || true
+}
 trap cleanup EXIT
+
+# 开跑前清掉任何 stale 实例:多个 degradation_node 会让 /robot/wheel_status 速率成倍叠加
+# (N 个实例 → N× 速率);残留 Isaac/topic-pub 同样污染数据。务必单实例。
+pkill -9 -f "w2_sim.degradation_node" 2>/dev/null || true
+pkill -9 -f "isaac/w2_sim_app.py"     2>/dev/null || true
+pkill -9 -f "topic pub /sim"          2>/dev/null || true
+sleep 2
 
 ros2 run w2_sim degradation_node --ros-args \
   -p seed:="$SEED" -p params_out:="$OUT/episode_params.yaml" &

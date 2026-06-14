@@ -285,14 +285,14 @@ def yaw_of(quat_wxyz):
 steer_idx_arr = np.array(steer_idx)
 wheel_idx_arr = np.array(wheel_idx)
 
-# 用显式步数计数推进仿真(每步 1/PHYS_HZ 秒),不依赖 world.current_time 的初值——
-# 仿真时间 t = step / PHYS_HZ。world.step(render=True) 每调用一次推进一个 physics_dt。
-n_steps = int(round(args.duration * PHYS_HZ))
-print(f"LOOP_START current_time={world.current_time:.3f} duration={args.duration} "
-      f"n_steps={n_steps}", flush=True)
-for step in range(n_steps):
+# 时间驱动:world.step(render=True) 每次推进一个 rendering_dt(实测此 build 渲染步进,
+# 不是 physics_dt),所以用 world.current_time 计时,对任意 per-step dt 都正确。
+# t0 锚定 reset 后初值,t = current_time - t0 为本次仿真已经过的秒数。
+t0 = world.current_time
+print(f"LOOP_START current_time={t0:.3f} duration={args.duration}", flush=True)
+while world.current_time - t0 < args.duration:
     world.step(render=True)
-    t = step / PHYS_HZ
+    t = world.current_time - t0
     cmd = profile[min(int(t * CMD_HZ), len(profile) - 1), 1:]
     pos, quat = robot.get_world_pose()
     if not (box[0] < pos[0] < box[1] and box[2] < pos[1] < box[3]):
