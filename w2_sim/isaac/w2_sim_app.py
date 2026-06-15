@@ -126,8 +126,15 @@ _, lidar_prim = omni.kit.commands.execute(
 lidar_rp = rep.create.render_product(lidar_prim.GetPath(), [1, 1])
 
 # ---- 前视相机(挂 camera_link)----
+# 朝向(z-up 世界里的标准前视相机):
+#   camera_link 继承 base_link 朝向(x前/y左/z上)。USD 相机默认看自己的 -Z、
+#   上方是 +Y;不旋转就朝下看地面。需让相机 -Z 对齐 base +X(前)、+Y 对齐 base +Z(上)。
+#   对应旋转矩阵 R(列=相机轴在 base 系)= [[0,0,-1],[-1,0,0],[0,1,0]],
+#   四元数 (w,x,y,z)=(0.5,0.5,-0.5,-0.5)。已校验:-Z→(1,0,0),+Y→(0,0,1)。
 cam = UsdGeom.Camera.Define(get_current_stage(), CAMERA_LINK + "/front_camera")
 cam.GetFocalLengthAttr().Set(CAMERA_FOCAL_LENGTH_MM)
+# 用 xformOp 设朝向(Gf.Quatf:实部 + 虚部向量)。AddOrientOp 默认无旋转,显式写入。
+cam.AddOrientOp().Set(Gf.Quatf(0.5, Gf.Vec3f(0.5, -0.5, -0.5)))
 cam_rp = rep.create.render_product(CAMERA_LINK + "/front_camera", (640, 480))
 
 # ===========================================================================
@@ -163,9 +170,12 @@ og.Controller.edit(
             ("Lidar.inputs:fullScan", True),
         ],
         og.Controller.Keys.CONNECT: [
-            ("Tick.outputs:tick", "Rgb.inputs:execIn"),
-            ("Tick.outputs:tick", "Info.inputs:execIn"),
+            # 相机 Rgb/Info 必须走 RunOnce(OgnIsaacRunOneSimulationFrame)强制渲染一帧,
+            # 否则无头模式下自定义 render product 从不被渲染 → RGB 像素全 0(纯黑)。
+            # lidar 此前已走 RunOnce 所以点云正常;相机此前直挂 Tick 故全黑。
             ("Tick.outputs:tick", "RunOnce.inputs:execIn"),
+            ("RunOnce.outputs:step", "Rgb.inputs:execIn"),
+            ("RunOnce.outputs:step", "Info.inputs:execIn"),
             ("RunOnce.outputs:step", "Lidar.inputs:execIn"),
             ("Ctx.outputs:context", "Rgb.inputs:context"),
             ("Ctx.outputs:context", "Info.inputs:context"),
