@@ -10,7 +10,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Imu, JointState
 from w2_sim.perturbation import (DEFAULT_CFG, GyroCorruptor, params_to_dict,
                                  sample_params)
-from w2_sim.swerve_kinematics import WHEEL_NAMES, WHEEL_RADIUS
+from w2_sim.swerve_kinematics import (WHEEL_NAMES, WHEEL_RADIUS,
+                                       forward_kinematics_ls)
 
 
 def joint_state_to_modules(names, positions, velocities):
@@ -35,6 +36,7 @@ class DegradationNode(Node):
         self.rng = np.random.default_rng(seed + 10_000)   # 白噪声流与参数采样分离
         self.gyro = GyroCorruptor(self.p, np.random.default_rng(seed + 20_000))
         self.last_imu_t = None
+        self.cur_speed = 0.0    # 当前车速 |v| m/s,由 on_js 更新,供 on_imu 振动项使用
         out = Path(self.get_parameter("params_out").value)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(yaml.safe_dump(params_to_dict(self.p), sort_keys=False))
@@ -53,6 +55,9 @@ class DegradationNode(Node):
         except KeyError as e:
             self.get_logger().warn(f"joint 缺失: {e}", throttle_duration_sec=5.0)
             return
+        # 缓存当前车速 |v|(用干净真值,代表运动强度),供 on_imu 振动项使用
+        vx, vy, _ = forward_kinematics_ls(angles, speeds)
+        self.cur_speed = float(np.hypot(vx, vy))
         ca, cs = self._corrupt_wheel(angles, speeds, self.p, self.rng)
         out = JointState()
         out.header.stamp = msg.header.stamp        # 保留原始仿真时间戳
@@ -72,8 +77,8 @@ class DegradationNode(Node):
                       msg.angular_velocity.z])
         a = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y,
                       msg.linear_acceleration.z])
-        cw = self.gyro.step(dt, w)
-        ca = self.gyro.step_accel(a)
+        cw = self.gyro.step(dt, w, self.cur_speed)
+        ca = self.gyro.step_accel(a, self.cur_speed)
         out = Imu()
         out.header.stamp = msg.header.stamp
         out.header.frame_id = "imu_link"            # 与实车 bag 一致(实测)

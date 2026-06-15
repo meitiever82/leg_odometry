@@ -6,4 +6,10 @@ gyro_bias_init_max_dps: 0.5
 gyro_rw_std: 5.0e-5
 gyro_noise_density_dps_sqrthz: 0.01
 accel_noise_density_mg_sqrthz: 0.1
+# 运动相关机械振动斜率(标定自真实 bag noise-vs-speed 分桶,见 scripts/analyze_imu_vib.py)。
+# 总噪声 std = sqrt(electronic² + (coeff·|车速|)²),静止退化为电子底。
+# 取 sqrt(真机斜率² − 仿真物理斜率²):仿真 /sim/imu 干净流本身已随速度振动,
+# 陀螺补足差额 ≈0.58;加速度仿真物理已 >真机,accel 系数置 0(不再叠加)。
+gyro_vib_coeff_dps_per_mps: 0.58
+accel_vib_coeff_mps2_per_mps: 0.0
 imu_rate_hz: 200.0

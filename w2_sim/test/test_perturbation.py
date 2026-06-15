@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from w2_sim.perturbation import (
     sample_params, corrupt_wheel, GyroCorruptor, theoretical_kappa,
-    params_to_dict, DEFAULT_CFG)
+    params_to_dict, vibration_std, DEFAULT_CFG)
 
 
 def test_sampling_deterministic_and_in_range():
@@ -45,6 +45,59 @@ def test_gyro_corruptor_stats():
     # 零输入下输出均值 ≈ bias(漂移慢),标准差 ≈ 白噪声 σ
     np.testing.assert_allclose(out.mean(axis=0), p.gyro_bias_init_rad, atol=5e-3)
     np.testing.assert_allclose(out.std(axis=0), p.gyro_noise_std_rad, rtol=0.3)
+
+
+def test_vibration_std_pure_function():
+    # speed=0 → 只有电子底
+    assert vibration_std(0.05, 0.3, 0.0) == pytest.approx(0.05)
+    # speed 大 → 振动主导,符合 sqrt(e² + (c·v)²)
+    assert vibration_std(0.05, 0.3, 2.0) == pytest.approx(np.hypot(0.05, 0.6))
+    # 单调递增
+    s = [vibration_std(0.05, 0.3, v) for v in [0, 0.5, 1.0, 2.0]]
+    assert all(b > a for a, b in zip(s, s[1:]))
+    # 逐轴 ndarray 也支持
+    out = vibration_std(np.array([0.05, 0.07, 0.06]), 0.3, 1.0)
+    np.testing.assert_allclose(out, np.hypot([0.05, 0.07, 0.06], 0.3))
+
+
+def test_gyro_corruptor_vibration_scales_with_speed():
+    # speed=0 时 std ≈ 电子底;speed 大时 std 随速度按公式抬升
+    p = sample_params(5, DEFAULT_CFG)
+    n, dt = 40000, 1.0 / 200
+    g0 = GyroCorruptor(p, np.random.default_rng(1))
+    out0 = np.array([g0.step(dt, np.zeros(3), 0.0) for _ in range(n)])
+    g1 = GyroCorruptor(p, np.random.default_rng(2))
+    spd = 1.0
+    out1 = np.array([g1.step(dt, np.zeros(3), spd) for _ in range(n)])
+    # 去 bias 后逐轴 std
+    s0 = out0.std(axis=0)
+    s1 = out1.std(axis=0)
+    np.testing.assert_allclose(s0, p.gyro_noise_std_rad, rtol=0.05)
+    exp1 = np.hypot(p.gyro_noise_std_rad, p.gyro_vib_coeff_rad * spd)
+    np.testing.assert_allclose(s1, exp1, rtol=0.05)
+    assert np.all(s1 > s0 * 2)   # 行驶噪声显著大于静止
+
+
+def test_accel_corruptor_vibration_scales_with_speed():
+    # 显式给非零 accel 振动系数验证机制(标定后默认 accel 系数为 0,见 perturbation.py 注释)
+    cfg = dict(DEFAULT_CFG, accel_vib_coeff_mps2_per_mps=0.5)
+    p = sample_params(6, cfg)
+    n = 40000
+    g = GyroCorruptor(p, np.random.default_rng(3))
+    out0 = np.array([g.step_accel(np.zeros(3), 0.0) for _ in range(n)])
+    out1 = np.array([g.step_accel(np.zeros(3), 1.0) for _ in range(n)])
+    np.testing.assert_allclose(out0.std(axis=0), p.accel_noise_std, rtol=0.05)
+    exp1 = np.hypot(p.accel_noise_std, p.accel_vib_coeff * 1.0)
+    np.testing.assert_allclose(out1.std(axis=0), exp1, rtol=0.05)
+    assert p.accel_vib_coeff == pytest.approx(0.5)
+
+
+def test_backward_compat_default_speed_zero():
+    # 不传 speed → 退化为原电子底行为
+    p = sample_params(7, DEFAULT_CFG)
+    g = GyroCorruptor(p, np.random.default_rng(4))
+    out = np.array([g.step(1.0 / 200, np.zeros(3)) for _ in range(20000)])
+    np.testing.assert_allclose(out.std(axis=0), p.gyro_noise_std_rad, rtol=0.1)
 
 
 def test_params_roundtrip_dict():
