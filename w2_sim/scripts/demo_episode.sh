@@ -59,13 +59,13 @@ sleep 2
 echo "[demo] ENV=$ENV DUR=${DUR}s RECORD=$RECORD SEED=$SEED"
 
 # --- 静态 TF:base_link -> 各传感器帧(外参取自 swerve urdf) ---
-# rslidar:  xyz 0.25 0 0.55  rpy 0 1.01 0  (前倾约 58°)
+# rslidar:  xyz 0.25 0 0.55  rpy 0 0 0  (AIRY 竖直安装,半球穹顶朝上,与 urdf 一致)
 ros2 run tf2_ros static_transform_publisher \
-  --x 0.25 --y 0 --z 0.55 --roll 0 --pitch 1.01 --yaw 0 \
+  --x 0.25 --y 0 --z 0.55 --roll 0 --pitch 0 --yaw 0 \
   --frame-id base_link --child-frame-id rslidar &
 # imu_link: 与 rslidar 同位姿(urdf 里 rslidar->imu 为单位变换)
 ros2 run tf2_ros static_transform_publisher \
-  --x 0.25 --y 0 --z 0.55 --roll 0 --pitch 1.01 --yaw 0 \
+  --x 0.25 --y 0 --z 0.55 --roll 0 --pitch 0 --yaw 0 \
   --frame-id base_link --child-frame-id imu_link &
 # camera_link: xyz 0.30 0 0.50  rpy 0 0 0
 ros2 run tf2_ros static_transform_publisher \

@@ -76,13 +76,18 @@
   <xacro:swerve_module prefix="rear_left"   x="${-wheelbase/2}" y="${ track_width/2}"/>
   <xacro:swerve_module prefix="rear_right"  x="${-wheelbase/2}" y="${-track_width/2}"/>
 
-  <!-- 传感器帧。倾角为近似值(design §4:精确外参非本期关键);
-       Task 11 验证步骤会用实车静止段重力方向校核倾角符号。 -->
+  <!-- 传感器帧。
+       rslidar:RoboSense AIRY 竖直安装(半球穹顶 FOV 沿传感器 +Z 朝上)。
+       真机外参取自 finder_lidar_mapping/glim_ros2/launch/airy_tf_tree.launch.py:
+       base_link→imu_link RPY(3.1415,0,-1.5708) 复合 imu_link→rslidar 四元数
+       (0.7098,-0.7044,0.0050,-0.0015) 后,base_link→rslidar 旋转 ≈ 单位阵
+       (残差 <0.01 rad,属标定噪声),即 rslidar +Z ≈ base +Z(朝上)。
+       位置 xyz(0.25,0,0.55) 为合理估计(真机标定平移仅毫米级,可忽略)。 -->
   <link name="rslidar"/>
   <joint name="base_link_to_rslidar" type="fixed">
     <parent link="base_link"/>
     <child  link="rslidar"/>
-    <origin xyz="0.25 0 0.55" rpy="0 1.01 0"/>  <!-- pitch ~58° 前倾(近似) -->
+    <origin xyz="0.25 0 0.55" rpy="0 0 0"/>  <!-- AIRY 竖直安装,半球穹顶朝上 -->
   </joint>
 
   <link name="imu_link"/>

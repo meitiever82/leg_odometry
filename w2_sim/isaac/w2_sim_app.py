@@ -43,8 +43,9 @@ from isaacsim.core.prims import SingleArticulation  # noqa: E402
 from isaacsim.core.utils.extensions import enable_extension  # noqa: E402
 from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage  # noqa: E402
 from isaacsim.core.utils.types import ArticulationAction  # noqa: E402
+from isaacsim.core.utils.xforms import reset_and_set_xform_ops  # noqa: E402
 from isaacsim.storage.native import get_assets_root_path  # noqa: E402
-from pxr import Gf, UsdGeom, UsdPhysics  # noqa: E402
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics  # noqa: E402
 
 enable_extension("isaacsim.ros2.bridge")
 enable_extension("isaacsim.sensors.physics")
@@ -115,14 +116,66 @@ omni.kit.commands.execute(
     path="imu_sensor", parent=IMU_LINK,
     translation=Gf.Vec3d(0, 0, 0), orientation=Gf.Quatd(1, 0, 0, 0))
 
-# ---- RTX Lidar(挂 rslidar)----
-# 内置配置(Ouster/OS1/OS1_REV6_32ch10hz1024res.json),传 basename。
-LIDAR_CONFIG = "OS1_REV6_32ch10hz1024res"
-_, lidar_prim = omni.kit.commands.execute(
-    "IsaacSensorCreateRtxLidar",
-    path="rtx_lidar", parent=RSLIDAR_LINK,
-    config=LIDAR_CONFIG,
-    translation=Gf.Vec3d(0, 0, 0), orientation=Gf.Quatd(1, 0, 0, 0))
+# ---- RTX Lidar(挂 rslidar):忠实仿真 RoboSense AIRY ----
+# Isaac Sim 5.x 的 RTX lidar 不再用本地 JSON config:IsaacSensorCreateRtxLidar 的
+# config= 只解析 SUPPORTED_LIDAR_CONFIGS 里的资产服务器 USD 名(见
+# exts/isaacsim.sensors.rtx/.../impl/{commands,supported_lidar_configs}.py)。真实参数
+# 存在 OmniLidar prim 的 `omni:sensor:Core:*` 属性里(旧 JSON schema 已迁进 USD)。
+#
+# 关键实测教训:lidar 插件在 **sensor 创建时** 解析并缓存这些 Core 配置;创建后再覆写
+# prim 属性插件不重读 —— 用 OS1 模板创建再覆写成 96 线 / 0~90° 后,prim 属性确实变了
+# (probe 读回 96 全对),但渲染时插件仍按模板 32 线缓存,报
+# "NumberOfEmitters 96 != param vector length 32" + "Unknown scan type 0" 并崩溃。
+# 因此正确做法:离线把 OS1 模板覆写成 AIRY 后导出 flatten 的本地 USD
+# (isaac/make_airy_usd.py → config/RS_Airy.usd,AIRY 值是 concrete spec),
+# 主程序用 add_reference_to_stage **引用**这个 USD —— 插件创建时直接解析到 AIRY。
+# (config= 传本地 USD/JSON 路径都不被 IsaacSensorCreateRtxLidar 接受,只认资产服务器名,
+#  故绕开该命令,直接 add_reference_to_stage 引用本地 USD,与命令内部 _add_reference 同理。)
+#
+# RoboSense AIRY 规格(手册表1 + 真实 bag 实测):
+#   96 线,垂直 FOV 0~90°(0.947° 步,均布,半球穹顶,沿传感器 +Z),
+#   水平 360° @ 0.4° 分辨率(900 方位步),10Hz 旋转式,
+#   测距 0.1~60m,距离精度 1.5cm(1σ 高斯),强度 1~255,单回波 strongest。
+#   出点 96×900 = 86,400 pts/帧 ≈ 手册 856,320 pts/s。
+#   若 config/RS_Airy.usd 不存在,先跑:
+#     $ISAACSIM_DIR/python.sh isaac/make_airy_usd.py
+AIRY_USD = str(Path(__file__).resolve().parent.parent / "config" / "RS_Airy.usd")
+LIDAR_CONFIG = AIRY_USD
+assert Path(AIRY_USD).exists(), \
+    f"AIRY USD 不存在: {AIRY_USD}(先跑 isaac/make_airy_usd.py 生成)"
+
+# 关键实测教训:lidar 插件解析 emitter 配置时,**不读 stage 上经 reference/override
+# 合成后的属性,而是顺着 prim 的 reference 去读原始资产文件**。所以无论
+#   (a) 用 OS1 模板就地覆写(插件读 payload ./OS1_*.usda → 32 线),
+#   (b) 用 Example_Rotary 模板就地覆写(插件读 reference Example_Rotary.usda → 128 线),
+#   (c) add_reference_to_stage 引用 flatten 好的 RS_Airy.usd(插件仍读到 128 / scanType 0),
+# prim 属性读回都对(96),但插件一律报 "NumberOfEmitters 96 != 32/128" + "scanType 0" 崩溃。
+# 解决:用 Sdf.CopySpec 把 flatten 好的 RS_Airy.usd 的 OmniLidar prim spec **物理拷贝**
+# 进本 stage 的目标路径(无任何 reference/payload,全是 concrete spec),插件顺着 prim
+# 找不到外部资产,只能读 prim 自身 concrete 的 96 线 AIRY 配置。
+LIDAR_PRIM_PATH = RSLIDAR_LINK + "/rtx_lidar"
+_src_stage = Usd.Stage.Open(AIRY_USD)
+_src_default = _src_stage.GetDefaultPrim()
+assert _src_default and _src_default.GetTypeName() == "OmniLidar", \
+    f"RS_Airy.usd defaultPrim 不是 OmniLidar(got {_src_default.GetTypeName() if _src_default else None})"
+_src_layer = _src_stage.GetRootLayer()
+_dst_layer = get_current_stage().GetRootLayer()
+# 目标父 prim 必须先存在;CopySpec 会建目标 prim spec。
+Sdf.CreatePrimInLayer(_dst_layer, LIDAR_PRIM_PATH)
+ok_copy = Sdf.CopySpec(_src_layer, _src_default.GetPath(),
+                       _dst_layer, LIDAR_PRIM_PATH)
+assert ok_copy, "Sdf.CopySpec 拷贝 AIRY OmniLidar spec 失败"
+lidar_prim = get_current_stage().GetPrimAtPath(LIDAR_PRIM_PATH)
+assert lidar_prim.IsValid() and lidar_prim.GetTypeName() == "OmniLidar", \
+    f"CopySpec 后 {LIDAR_PRIM_PATH} 不是 OmniLidar(type={lidar_prim.GetTypeName()})"
+# 朝向:相对 rslidar link 为单位(rslidar link 已在 urdf 里竖直安装,AIRY 半球朝上)。
+reset_and_set_xform_ops(lidar_prim, Gf.Vec3d(0, 0, 0), Gf.Quatd(1, 0, 0, 0))
+print(f"AIRY_LIDAR: copyspec<-{AIRY_USD} prim={lidar_prim.GetPath()} "
+      f"scanType={lidar_prim.GetAttribute('omni:sensor:Core:scanType').Get()} "
+      f"nEmit={lidar_prim.GetAttribute('omni:sensor:Core:numberOfEmitters').Get()} "
+      f"elN={len(lidar_prim.GetAttribute('omni:sensor:Core:emitterState:s001:elevationDeg').Get())}",
+      flush=True)
+
 lidar_rp = rep.create.render_product(lidar_prim.GetPath(), [1, 1])
 
 # ---- 前视相机(挂 camera_link)----
@@ -165,8 +218,9 @@ og.Controller.edit(
             ("Lidar.inputs:type", "point_cloud"),
             ("Lidar.inputs:topicName", "/rslidar_points"),
             ("Lidar.inputs:frameId", "rslidar"),
-            # fullScan=True:累积满一整圈再发(≈10Hz,匹配 OS1 旋转率),
+            # fullScan=True:累积满一整圈再发(≈10Hz,匹配 AIRY 旋转率),
             # 而非每渲染帧发部分扫描(默认 False → 30Hz 稀疏帧)。
+            # point_cloud 类型发完整 sensor_msgs/PointCloud2,含 xyz + intensity 字段。
             ("Lidar.inputs:fullScan", True),
         ],
         og.Controller.Keys.CONNECT: [
