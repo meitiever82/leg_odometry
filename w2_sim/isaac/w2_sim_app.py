@@ -57,7 +57,18 @@ from w2_sim.swerve_kinematics import WHEEL_NAMES, WHEEL_RADIUS, inverse_kinemati
 from w2_sim.trajectory_generator import generate_profile  # noqa: E402
 
 PHYS_HZ, CMD_HZ = 200.0, 50.0
-RENDER_HZ = 30.0
+# RENDER_HZ 必须 = AIRY 旋转率(10Hz)—— 这是雷达点云在"渲染欠载"下稳定的关键。
+# 原值 30Hz 时,RTX 雷达每圈(0.1s)需累积 3 个渲染帧(每帧 ~120° 方位),由
+# ROS2RtxLidarHelper(fullScan=True)内部的 IsaacCreateRTXLidarScanBuffer 拼成 360°。
+# 渲染欠载时(场景/视角让 RTX 吃力,或 GPU/CPU 被抢占),某些渲染帧的射线追踪结果
+# 来不及刷新 → 累积器拿到陈旧/错位的方位扇区 → 拼出的"整圈"实为 121°~360° 漂移覆盖
+# (静止时点云质心在多个离散态间循环跳变,实测 ep16 帧间跳动 mean 6.86m/89.9% 帧 >1m)。
+# 把 rendering_dt 设为整圈周期(1/10s)后,每条雷达消息恰由**单个渲染帧**产生整圈,
+# 不再跨帧拼接,故对渲染欠载结构性免疫(实测:重度 CPU+GPU 压力下静止段质心跳动
+# 仍 mean 0.012m / 0% 帧 >1m,等同正常场景)。代价:相机/camera_info 也降到 10Hz
+# (与雷达共享渲染 tick);物理率话题(imu 200Hz / odom 100Hz / joint_states 50Hz)
+# 走独立 ONDEMAND 物理图,不受影响。10Hz RGB 对视觉闭环足够。
+RENDER_HZ = 10.0
 CAMERA_FOCAL_LENGTH_MM = 18.0  # ~50° HFoV(aperture 默认 20.955mm),近似前视相机
 
 world = World(stage_units_in_meters=1.0,
@@ -218,9 +229,10 @@ og.Controller.edit(
             ("Lidar.inputs:type", "point_cloud"),
             ("Lidar.inputs:topicName", "/rslidar_points"),
             ("Lidar.inputs:frameId", "rslidar"),
-            # fullScan=True:累积满一整圈再发(≈10Hz,匹配 AIRY 旋转率),
-            # 而非每渲染帧发部分扫描(默认 False → 30Hz 稀疏帧)。
-            # point_cloud 类型发完整 sensor_msgs/PointCloud2,含 xyz + intensity 字段。
+            # fullScan=True:累积满一整圈再发(匹配 AIRY 10Hz 旋转率),而非每渲染帧
+            # 发部分扫描(默认 False → 每条消息只是 ~120° 扇区,质心随扇区朝向跳)。
+            # 配合 RENDER_HZ=10(rendering_dt=整圈周期),"累积一整圈"恰好 = 单个渲染帧,
+            # 故每条消息是确定性的完整 360° 半球扫描,且对渲染欠载免疫(见 RENDER_HZ 注释)。
             ("Lidar.inputs:fullScan", True),
         ],
         og.Controller.Keys.CONNECT: [
