@@ -189,6 +189,27 @@ print(f"AIRY_LIDAR: copyspec<-{AIRY_USD} prim={lidar_prim.GetPath()} "
 
 lidar_rp = rep.create.render_product(lidar_prim.GetPath(), [1, 1])
 
+# ---- RTX Lidar intensity annotator(替代 ROS2RtxLidarHelper 的 point_cloud 发布)----
+# 本构建的 ROS2RtxLidarHelper(type=point_cloud)及其底层 ROS2PublishPointCloud og 节点
+# 只发 XYZ(point3f),没有 intensity 字段。真实 AIRY 的 /rslidar_points 带 intensity
+# (反射率 1~255)。为补上 intensity,改走 IsaacCreateRTXLidarScanBuffer 标注器:
+#   annotator.get_data() → {"data": (N,3) float32 xyz(lidar 系),
+#                           "intensity": (N,) float32 反射率 [0,1], ...}
+# 然后在主循环里自己用 rclpy 发 sensor_msgs/PointCloud2,字段 [x,y,z,intensity]
+# (不含 ring —— AIRY 没有 ring,真实 bag 的 ring 是驱动加的索引,不需要)。
+#
+# fullScan 稳定性:ScanBuffer 标注器每次 get_data() 返回的是**一整圈完整扫描**;
+# 配合 RENDER_HZ=10(rendering_dt=AIRY 整圈周期 0.1s),每个渲染帧恰好产生一整圈,
+# 故每条消息=单渲染帧=完整 360° 半球扫描,与原 ROS2RtxLidarHelper(fullScan=True)
+# 同样对渲染欠载结构性免疫(质心帧间跳动 <0.1m)。
+# transformPoints=False:点保持在 lidar 局部系(frame_id=rslidar),与原行为一致。
+_lidar_annot = rep.AnnotatorRegistry.get_annotator("IsaacCreateRTXLidarScanBuffer")
+_lidar_annot.initialize(outputIntensity=True, transformPoints=False)
+_lidar_annot.attach([lidar_rp.path])
+# Isaac RTX intensity 是反射率 [0,1];真实 AIRY 是 [1,255](实测 bag:min0 max255
+# mean25.8 p95=91,~75% 非零)。线性缩放 ×255 后下限 clip 到 1,量级与真实对齐。
+LIDAR_INTENSITY_SCALE = 255.0
+
 # ---- 前视相机(挂 camera_link)----
 # 朝向(z-up 世界里的标准前视相机):
 #   camera_link 继承 base_link 朝向(x前/y左/z上)。USD 相机默认看自己的 -Z、
@@ -215,7 +236,9 @@ og.Controller.edit(
             ("Rgb", "isaacsim.ros2.bridge.ROS2CameraHelper"),
             # 本构建 ROS2CameraHelper 不支持 type=camera_info,改用专用 ROS2CameraInfoHelper。
             ("Info", "isaacsim.ros2.bridge.ROS2CameraInfoHelper"),
-            ("Lidar", "isaacsim.ros2.bridge.ROS2RtxLidarHelper"),
+            # 注:lidar 不再走 ROS2RtxLidarHelper(它只发 XYZ,无 intensity)。
+            # 改用上面 attach 的 IsaacCreateRTXLidarScanBuffer 标注器 + 主循环 rclpy 发布。
+            # 但仍需 RunOnce 强制渲染雷达 render product —— 标注器靠渲染帧驱动。
         ],
         og.Controller.Keys.SET_VALUES: [
             ("Rgb.inputs:renderProductPath", cam_rp.path),
@@ -225,15 +248,6 @@ og.Controller.edit(
             ("Info.inputs:renderProductPath", cam_rp.path),
             ("Info.inputs:topicName", "/camera/color/camera_info"),
             ("Info.inputs:frameId", "camera_link"),
-            ("Lidar.inputs:renderProductPath", lidar_rp.path),
-            ("Lidar.inputs:type", "point_cloud"),
-            ("Lidar.inputs:topicName", "/rslidar_points"),
-            ("Lidar.inputs:frameId", "rslidar"),
-            # fullScan=True:累积满一整圈再发(匹配 AIRY 10Hz 旋转率),而非每渲染帧
-            # 发部分扫描(默认 False → 每条消息只是 ~120° 扇区,质心随扇区朝向跳)。
-            # 配合 RENDER_HZ=10(rendering_dt=整圈周期),"累积一整圈"恰好 = 单个渲染帧,
-            # 故每条消息是确定性的完整 360° 半球扫描,且对渲染欠载免疫(见 RENDER_HZ 注释)。
-            ("Lidar.inputs:fullScan", True),
         ],
         og.Controller.Keys.CONNECT: [
             # 相机 Rgb/Info 必须走 RunOnce(OgnIsaacRunOneSimulationFrame)强制渲染一帧,
@@ -242,10 +256,8 @@ og.Controller.edit(
             ("Tick.outputs:tick", "RunOnce.inputs:execIn"),
             ("RunOnce.outputs:step", "Rgb.inputs:execIn"),
             ("RunOnce.outputs:step", "Info.inputs:execIn"),
-            ("RunOnce.outputs:step", "Lidar.inputs:execIn"),
             ("Ctx.outputs:context", "Rgb.inputs:context"),
             ("Ctx.outputs:context", "Info.inputs:context"),
-            ("Ctx.outputs:context", "Lidar.inputs:context"),
         ],
     })
 
@@ -361,13 +373,108 @@ def yaw_of(quat_wxyz):
 steer_idx_arr = np.array(steer_idx)
 wheel_idx_arr = np.array(wheel_idx)
 
+# ===========================================================================
+# /rslidar_points(带 intensity)发布 —— 走 sidecar 进程,不在 Isaac 内用 rclpy。
+#
+# 为什么不在 Isaac 进程里直接 rclpy 发:Isaac 嵌入式 Python 是 cp311,而
+# `source /opt/ros/jazzy` 的系统 ROS2 python 栈是 cp312。两套 rosidl typesupport
+# (rclpy._rclpy / rcl_interfaces 的 *_s.c .so)ABI 不兼容:
+#   * 直接 import 系统 cp312 rclpy → "No module named 'rclpy._rclpy_pybind11'"
+#     (找不到 cp311 .so)崩溃;
+#   * 改用 bridge 自带的 cp311 rclpy(<ext>/jazzy/rclpy)→ Node() 创建时 cp311
+#     的 _rclpy 撞上经 LD_LIBRARY_PATH/AMENT 解析到的 /opt/ros cp312 typesupport,
+#     在 rcl_interfaces.ParameterEvent 转换处触发 C 断言 abort(core dumped,实测)。
+# 这是经典双 ROS 安装混装冲突,在单进程内难以干净化解。
+#
+# 同时本构建的 ROS2RtxLidarHelper / ROS2PublishPointCloud og 节点只发 XYZ
+# (point3f),没有 intensity 字段;真实 AIRY 的 /rslidar_points 带 intensity。
+#
+# 方案:Isaac 主循环把每帧 xyz+intensity 通过 UNIX 域 socket(SOCK_STREAM,长度前缀
+# 分帧)发给一个**系统 cp312 python 的 sidecar 节点**(scripts/lidar_pc2_publisher.py,
+# 由 collect_episode.sh 用 ros2 run 同 degradation_node 一样拉起),由它组
+# sensor_msgs/PointCloud2(字段 [x,y,z,intensity],无 ring)发 /rslidar_points。
+# sidecar 跑在干净的系统 ROS2 环境里,rclpy 正常工作。
+#
+# fullScan 稳定性:IsaacCreateRTXLidarScanBuffer 每次 get_data() 返回一整圈完整扫描;
+# 配合 RENDER_HZ=10(rendering_dt=AIRY 整圈周期 0.1s),每渲染帧=一整圈,故每条消息
+# =单渲染帧=完整 360° 半球扫描,对渲染欠载结构性免疫(质心帧间跳动 <0.1m)。
+# 时间戳用 sim-time(world.current_time),与 /clock、相机、imu 一致。
+import os  # noqa: E402
+import socket  # noqa: E402
+import struct  # noqa: E402
+
+_LIDAR_SOCK_PATH = os.environ.get("W2_LIDAR_SOCK", "/tmp/w2_sim_lidar.sock")
+# 帧头:magic(u32) seq(u32) sim_time(f64) n_points(u32) —— 之后 n*4 个 float32。
+_LIDAR_HDR = struct.Struct("<IIdI")
+_LIDAR_MAGIC = 0x52534C44  # 'RSLD'
+_lidar_sock = None
+_lidar_seq = 0
+
+
+def _lidar_connect():
+    """连 sidecar 的 UNIX socket(sidecar 先起、监听)。失败返回 None,主循环重试。"""
+    global _lidar_sock
+    if _lidar_sock is not None:
+        return _lidar_sock
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(_LIDAR_SOCK_PATH)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 << 20)
+        _lidar_sock = s
+        print(f"LIDAR_SOCK: connected {_LIDAR_SOCK_PATH}", flush=True)
+    except (FileNotFoundError, ConnectionRefusedError, OSError):
+        _lidar_sock = None
+    return _lidar_sock
+
+
+def publish_lidar(sim_time):
+    """从标注器取一整圈 xyz+intensity,经 socket 发给 sidecar(含 intensity,无 ring)。"""
+    global _lidar_sock, _lidar_seq
+    data = _lidar_annot.get_data()
+    if not isinstance(data, dict):
+        return 0
+    xyz = data.get("data")
+    inten = data.get("intensity")
+    if xyz is None or inten is None:
+        return 0
+    xyz = np.asarray(xyz, dtype=np.float32)
+    inten = np.asarray(inten, dtype=np.float32).ravel()
+    if xyz.ndim != 2 or xyz.shape[0] == 0 or inten.shape[0] != xyz.shape[0]:
+        return 0
+    n = int(xyz.shape[0])
+    # Isaac 反射率 [0,1] → AIRY 量级 [1,255]:×255 后 clip 到 [1,255]。
+    inten = np.clip(inten * LIDAR_INTENSITY_SCALE, 1.0, 255.0).astype(np.float32)
+    buf = np.empty((n, 4), dtype=np.float32)
+    buf[:, 0:3] = xyz
+    buf[:, 3] = inten
+    payload = buf.tobytes()
+    s = _lidar_connect()
+    if s is None:
+        return 0
+    _lidar_seq += 1
+    try:
+        s.sendall(_LIDAR_HDR.pack(_LIDAR_MAGIC, _lidar_seq, float(sim_time), n) + payload)
+    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+        print(f"WARN lidar sock send failed ({e}); will reconnect", file=sys.stderr, flush=True)
+        try:
+            s.close()
+        except OSError:
+            pass
+        _lidar_sock = None
+        return 0
+    return n
+
 # 时间驱动:world.step(render=True) 每次推进一个 rendering_dt(实测此 build 渲染步进,
 # 不是 physics_dt),所以用 world.current_time 计时,对任意 per-step dt 都正确。
 # t0 锚定 reset 后初值,t = current_time - t0 为本次仿真已经过的秒数。
 t0 = world.current_time
 print(f"LOOP_START current_time={t0:.3f} duration={args.duration}", flush=True)
+_lidar_msg_count = 0
 while world.current_time - t0 < args.duration:
     world.step(render=True)
+    # 发布雷达点云(带 intensity)。每渲染帧标注器=一整圈,sim-time 戳。
+    if publish_lidar(world.current_time) > 0:
+        _lidar_msg_count += 1
     t = world.current_time - t0
     cmd = profile[min(int(t * CMD_HZ), len(profile) - 1), 1:]
     pos, quat = robot.get_world_pose()
@@ -384,5 +491,11 @@ while world.current_time - t0 < args.duration:
     robot.apply_action(ArticulationAction(
         joint_velocities=spd / WHEEL_RADIUS, joint_indices=wheel_idx_arr))
 
-print("SIM_DONE", flush=True)
+print(f"SIM_DONE lidar_msgs_sent={_lidar_msg_count}", flush=True)
+try:
+    _lidar_annot.detach()
+    if _lidar_sock is not None:
+        _lidar_sock.close()
+except Exception as _e:
+    print(f"WARN lidar cleanup: {_e}", file=sys.stderr, flush=True)
 app.close()

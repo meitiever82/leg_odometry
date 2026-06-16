@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'degradation_node = w2_sim.degradation_node:main',
+            'lidar_pc2_publisher = w2_sim.lidar_pc2_publisher:main',
         ],
     },
 )

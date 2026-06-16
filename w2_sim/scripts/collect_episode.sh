@@ -21,20 +21,29 @@ set -u
 # (它会污染下一次采集),所以再按进程名补杀一遍。
 cleanup() {
   kill $(jobs -p) 2>/dev/null || true
-  pkill -9 -f "w2_sim.degradation_node" 2>/dev/null || true
-  pkill -9 -f "isaac/w2_sim_app.py"     2>/dev/null || true
+  pkill -9 -f "w2_sim.degradation_node"    2>/dev/null || true
+  pkill -9 -f "w2_sim.lidar_pc2_publisher" 2>/dev/null || true
+  pkill -9 -f "isaac/w2_sim_app.py"        2>/dev/null || true
 }
 trap cleanup EXIT
 
 # 开跑前清掉任何 stale 实例:多个 degradation_node 会让 /robot/wheel_status 速率成倍叠加
 # (N 个实例 → N× 速率);残留 Isaac/topic-pub 同样污染数据。务必单实例。
-pkill -9 -f "w2_sim.degradation_node" 2>/dev/null || true
-pkill -9 -f "isaac/w2_sim_app.py"     2>/dev/null || true
-pkill -9 -f "topic pub /sim"          2>/dev/null || true
+pkill -9 -f "w2_sim.degradation_node"    2>/dev/null || true
+pkill -9 -f "w2_sim.lidar_pc2_publisher" 2>/dev/null || true
+pkill -9 -f "isaac/w2_sim_app.py"        2>/dev/null || true
+pkill -9 -f "topic pub /sim"             2>/dev/null || true
+rm -f /tmp/w2_sim_lidar.sock 2>/dev/null || true
 sleep 2
 
 ros2 run w2_sim degradation_node --ros-args \
   -p seed:="$SEED" -p params_out:="$OUT/episode_params.yaml" &
+
+# 雷达点云(带 intensity)sidecar:必须先于 Isaac 起好、监听 UNIX socket,
+# Isaac 主程序通过该 socket 推 xyz+intensity,本节点组 PointCloud2 发 /rslidar_points。
+# (Isaac 嵌入式 cp311 python 无法干净用系统 cp312 rclpy,详见 isaac/w2_sim_app.py 注释。)
+ros2 run w2_sim lidar_pc2_publisher &
+sleep 2   # 给 sidecar 时间 bind+listen,避免 Isaac 首帧连不上
 
 "$ISAACSIM_DIR/python.sh" "$PKG/isaac/w2_sim_app.py" \
   --seed "$SEED" --duration "$DUR" --env "$ENV" &
