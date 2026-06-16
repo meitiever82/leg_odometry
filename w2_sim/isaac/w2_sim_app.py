@@ -237,7 +237,8 @@ og.Controller.edit(
             # 本构建 ROS2CameraHelper 不支持 type=camera_info,改用专用 ROS2CameraInfoHelper。
             ("Info", "isaacsim.ros2.bridge.ROS2CameraInfoHelper"),
             # 注:lidar 不再走 ROS2RtxLidarHelper(它只发 XYZ,无 intensity)。
-            # 改用上面 attach 的 IsaacCreateRTXLidarScanBuffer 标注器 + 主循环 rclpy 发布。
+            # 改用上面 attach 的 IsaacCreateRTXLidarScanBuffer 标注器 + 主循环经
+            # UNIX socket 推给 sidecar(lidar_pc2_publisher)发 PointCloud2(带 intensity)。
             # 但仍需 RunOnce 强制渲染雷达 render product —— 标注器靠渲染帧驱动。
         ],
         og.Controller.Keys.SET_VALUES: [
