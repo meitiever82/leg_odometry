@@ -17,6 +17,7 @@
 #     输出 angVel / linAcc / orientation)。
 #   * 所有 print 必须 flush=True(app.close() 会吞缓冲)。
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -45,7 +46,7 @@ from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage 
 from isaacsim.core.utils.types import ArticulationAction  # noqa: E402
 from isaacsim.core.utils.xforms import reset_and_set_xform_ops  # noqa: E402
 from isaacsim.storage.native import get_assets_root_path  # noqa: E402
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics  # noqa: E402
+from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade  # noqa: E402
 
 enable_extension("isaacsim.ros2.bridge")
 enable_extension("isaacsim.sensors.physics")
@@ -75,17 +76,21 @@ world = World(stage_units_in_meters=1.0,
               physics_dt=1.0 / PHYS_HZ, rendering_dt=1.0 / RENDER_HZ)
 
 # ---- 场景 ----
+GROUND_PRIMS = []  # 用于绑高摩擦材质的地面 prim path(随场景而定)
 if args.env == "warehouse":
     assets = get_assets_root_path()
     if assets:
         add_reference_to_stage(
             usd_path=assets + "/Isaac/Environments/Simple_Warehouse/warehouse.usd",
             prim_path="/World/env")
+        GROUND_PRIMS.append("/World/env")
     else:
         print("WARN: 云资产不可达,退回平地", file=sys.stderr, flush=True)
         world.scene.add_default_ground_plane()
+        GROUND_PRIMS.append("/World/defaultGroundPlane")
 else:
     world.scene.add_default_ground_plane()
+    GROUND_PRIMS.append("/World/defaultGroundPlane")
 
 # ---- 机器人 ----
 add_reference_to_stage(usd_path=args.usd, prim_path="/World/w2")
@@ -118,6 +123,117 @@ print("LINK_PARENT:", LINK_PARENT, flush=True)
 robot = SingleArticulation(ROBOT_ROOT, name="w2",
                            position=np.array([0.0, 0.0, 0.3]))
 world.scene.add(robot)
+
+# ===========================================================================
+# 压低 wheel-LS ω_z 抖(Task 26,2026-06-16)。baseline RMS(wheel-LS ω_z vs 真值)=0.286,
+# 真机 0.050。诊断(scripts/diag_slip.py + 分频)定位真因:**不是 contact slip**——真值 ω_z
+# 本身光滑(高频 RMS 0.013)、轮子不纵向打滑(mu≥1 时 speed_ratio=1.000),抖全在 achieved
+# 轮速读数(高频 0.18,经 8×3 LS b=v·[cosθ,sinθ] 放大成 ω_z)。真正的旋钮是**轮速 velocity
+# drive 的阻尼 kd**(见下方 set_gains):kd 过高 velocity 环对接触力扰动过敏 → 读数振铃。
+# 这里的接触项(摩擦/solver/contactOffset)只做两件必需的事,对该抖几乎无影响:
+#   1. 高摩擦 PhysicsMaterial(static/dynamic=1.5)绑 4 轮 + 地面,combineMode=max
+#      —— **唯一必需**:mu 默认 ~0.5/0.01 时轮子真纵向打滑(speed_ratio 1.8),mu=1.5 归 1.0。
+#   2. solver 迭代 pos32/vel4、轮碰撞 contactOffset 2cm —— 稳接触,二阶项(实测对 RMS 影响小,
+#      过高 solver 反而更差;保守值)。
+# 不破坏 swerve:高摩擦只防纵向打滑,转向后仍纯滚动。
+# ===========================================================================
+_TUNE_OFF = os.environ.get("W2_TUNE_OFF", "0") == "1"  # A/B 对照:跳过全部接触调优
+WHEEL_FRICTION = float(os.environ.get("W2_WHEEL_FRICTION", "1.5"))
+SOLVER_POS_ITER = int(os.environ.get("W2_SOLVER_POS_ITER", "32"))
+SOLVER_VEL_ITER = int(os.environ.get("W2_SOLVER_VEL_ITER", "4"))
+
+
+def _make_friction_material(path, mu_s, mu_d):
+    """建一个高摩擦 PhysicsMaterial,combineMode=max(取轮/地较大者)。返回 prim path。"""
+    mat = UsdShade.Material.Define(stage, path)
+    mp = mat.GetPrim()
+    UsdPhysics.MaterialAPI.Apply(mp)
+    mapi = UsdPhysics.MaterialAPI(mp)
+    mapi.CreateStaticFrictionAttr().Set(mu_s)
+    mapi.CreateDynamicFrictionAttr().Set(mu_d)
+    mapi.CreateRestitutionAttr().Set(0.0)
+    pmat = PhysxSchema.PhysxMaterialAPI.Apply(mp)
+    pmat.CreateFrictionCombineModeAttr().Set("max")
+    pmat.CreateRestitutionCombineModeAttr().Set("min")
+    return path
+
+
+def _bind_physics_material(prim_path, mat_path):
+    """把 physics material 绑到 prim(及其碰撞子树)。"""
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        print(f"WARN friction: prim 不存在 {prim_path}", file=sys.stderr, flush=True)
+        return False
+    mat = UsdShade.Material.Get(stage, mat_path)
+    UsdShade.MaterialBindingAPI.Apply(prim)
+    UsdShade.MaterialBindingAPI(prim).Bind(
+        mat, UsdShade.Tokens.weakerThanDescendants, "physics")
+    return True
+
+
+if _TUNE_OFF:
+    print("CONTACT_TUNE: OFF (W2_TUNE_OFF=1) — 用 PhysX 默认接触做 A/B 对照", flush=True)
+else:
+    _WHEEL_MAT = _make_friction_material(
+        "/World/PhysicsMaterials/wheel_hi_fric", WHEEL_FRICTION, WHEEL_FRICTION)
+    _GROUND_MAT = _make_friction_material(
+        "/World/PhysicsMaterials/ground_hi_fric", WHEEL_FRICTION, WHEEL_FRICTION)
+
+    # 绑 4 轮碰撞体(cylinder 或 capsule,取决于 import 的 W2_WHEEL_CAPSULE)+ 调接触 offset。
+    # 碰撞子 prim 名随几何类型变,按带 CollisionAPI 的子 prim 找,不硬编码名。
+    _WHEEL_LINKS = ["front_left", "front_right", "rear_left", "rear_right"]
+    _n_wheel_bound = 0
+    for _w in _WHEEL_LINKS:
+        _link = stage.GetPrimAtPath(f"/World/w2/{_w}_wheel_link")
+        if not _link or not _link.IsValid():
+            print(f"WARN friction: wheel link 不存在 {_w}", file=sys.stderr, flush=True)
+            continue
+        for _cp in Usd.PrimRange(_link):
+            if _cp.HasAPI(UsdPhysics.CollisionAPI):
+                _cpath = str(_cp.GetPath())
+                if _bind_physics_material(_cpath, "/World/PhysicsMaterials/wheel_hi_fric"):
+                    _n_wheel_bound += 1
+                    _capi = PhysxSchema.PhysxCollisionAPI.Apply(_cp)
+                    _capi.CreateContactOffsetAttr().Set(0.02)
+                    _capi.CreateRestOffsetAttr().Set(0.0)
+    print(f"WHEEL_FRICTION_BOUND: {_n_wheel_bound}/4 collisions mu={WHEEL_FRICTION}",
+          flush=True)
+    assert _n_wheel_bound == 4, f"轮摩擦材质只绑上 {_n_wheel_bound}/4"
+
+    # 绑地面(warehouse 整子树 / defaultGroundPlane)
+    for _g in GROUND_PRIMS:
+        _bind_physics_material(_g, "/World/PhysicsMaterials/ground_hi_fric")
+    print(f"GROUND_FRICTION_BOUND: {GROUND_PRIMS}", flush=True)
+
+    # 提高 articulation solver 迭代(更硬接触,减滑移/穿透)
+    _root_prim = stage.GetPrimAtPath(ROBOT_ROOT)
+    _pxapi = PhysxSchema.PhysxArticulationAPI.Apply(_root_prim)
+    _pxapi.CreateSolverPositionIterationCountAttr().Set(SOLVER_POS_ITER)
+    _pxapi.CreateSolverVelocityIterationCountAttr().Set(SOLVER_VEL_ITER)
+    print(f"SOLVER_ITER: pos={SOLVER_POS_ITER} vel={SOLVER_VEL_ITER}", flush=True)
+
+# ===========================================================================
+# steer 关节驱动 maxForce 解锁(Task 26,2026-06-16):importer 把 steer revolute 的
+# drive:angular:physics:maxForce 设成 50(acceleration 模式),转向力矩被硬限,大角度
+# 转向瞬态时 achieved 角会短暂追不上 IK 命令角。把 4 个 steer drive 的 maxForce/stiffness
+# 调高、贴紧命令角,收窄转向瞬态窗口(转向瞬态是 wheel-LS ω_z 残余抖的次要来源,主因是
+# 轮速环阻尼,见 set_gains 处)。必须在 world.reset() 前改 USD 属性。
+STEER_MAX_FORCE = float(os.environ.get("W2_STEER_MAXFORCE", "5000.0"))
+STEER_STIFFNESS = float(os.environ.get("W2_STEER_STIFFNESS", "100000.0"))
+STEER_DAMPING = float(os.environ.get("W2_STEER_DAMPING", "3000.0"))
+_n_steer = 0
+for _p in stage.Traverse():
+    _pp = str(_p.GetPath())
+    if "steer_joint" in _pp and _p.GetTypeName() == "PhysicsRevoluteJoint":
+        _drv = UsdPhysics.DriveAPI.Get(_p, "angular")
+        if not _drv:
+            _drv = UsdPhysics.DriveAPI.Apply(_p, "angular")
+        _drv.CreateMaxForceAttr().Set(STEER_MAX_FORCE)
+        _drv.CreateStiffnessAttr().Set(STEER_STIFFNESS)
+        _drv.CreateDampingAttr().Set(STEER_DAMPING)
+        _n_steer += 1
+print(f"STEER_DRIVE_UNLOCK: {_n_steer} joints maxForce={STEER_MAX_FORCE} "
+      f"stiffness={STEER_STIFFNESS} damping={STEER_DAMPING}", flush=True)
 
 # ---- IMU 传感器(挂 imu_link)----
 # 注:父 prim 必须带 RigidBodyAPI;imu_link 是 rigid body(实测),用拍平后的真实路径。
@@ -372,11 +488,27 @@ wheel_idx = [dof[f"{w}_wheel_joint"] for w in WHEEL_NAMES]
 ndof = len(robot.dof_names)
 kps = np.zeros(ndof)
 kds = np.zeros(ndof)
+# steer 位置驱动刚度(W2_STEER_KP/KD 可调)。转向瞬态(achieved 角追命令角的滞后)是
+# wheel-LS ω_z 残余抖的次要来源;主因是轮速环阻尼(见下方 WHEEL_KD)。保持原刚度即可。
+STEER_KP = float(os.environ.get("W2_STEER_KP", "1e4"))
+STEER_KD = float(os.environ.get("W2_STEER_KD", "1e3"))
+# 轮速驱动增益 —— Task 26 的核心修复(2026-06-16)。
+# wheel-LS ω_z 的 RMS 几乎全是高频抖动(分频:5/11 帧平滑后掉到 ~0.07;真值 ω_z 本身光滑,
+# 高频 RMS 仅 0.013),全来自 achieved 轮速读数振荡:轮关节角速度被高 kd 纯阻尼速度环驱成
+# 欠阻尼,单轮速度抖 ±0.14 m/s(驱动速度 0.5~1 的 15~25%),经 8×3 LS(b=v·[cosθ,sinθ])
+# 直接放大成 ω_z 抖。轮子物理上滚得很稳(真值光滑、speed_ratio=1.0),抖只在**报出来的关节
+# 速度**里;与轮地摩擦/碰撞/solver 无关(那些不动速度环刚度)。
+# 把轮速环阻尼 kd 降下来消振铃。实测 RMS(wheel-LS ω_z vs 真值,ep19 seed1019,原始 render-步
+# 控制环、雷达 10Hz 不变):kd=1e3→0.195, 300→0.109, 120→0.044, 60→见下;
+# 太低(<~30)机器人欠驱(achieved 轮速跟不上命令)。kd=120 兼顾低抖(~0.045)与满程行进
+# (ratio 1.0,pathlen 13.5m),逼近真机 0.05。W2_WHEEL_KD 可调。
+WHEEL_KD = float(os.environ.get("W2_WHEEL_KD", "120.0"))
 for i in steer_idx:
-    kps[i], kds[i] = 1e4, 1e3
+    kps[i], kds[i] = STEER_KP, STEER_KD
 for i in wheel_idx:
-    kps[i], kds[i] = 0.0, 1e3
+    kps[i], kds[i] = 0.0, WHEEL_KD
 robot.get_articulation_controller().set_gains(kps=kps, kds=kds)
+print(f"STEER_GAINS: kp={STEER_KP} kd={STEER_KD}  WHEEL_KD={WHEEL_KD}", flush=True)
 
 profile = generate_profile(args.seed, args.duration, rate_hz=CMD_HZ)
 prev_angles = np.zeros(4)
@@ -417,7 +549,6 @@ wheel_idx_arr = np.array(wheel_idx)
 # 配合 RENDER_HZ=10(rendering_dt=AIRY 整圈周期 0.1s),每渲染帧=一整圈,故每条消息
 # =单渲染帧=完整 360° 半球扫描,对渲染欠载结构性免疫(质心帧间跳动 <0.1m)。
 # 时间戳用 sim-time(world.current_time),与 /clock、相机、imu 一致。
-import os  # noqa: E402
 import socket  # noqa: E402
 import struct  # noqa: E402
 
@@ -544,6 +675,18 @@ def publish_lidar(sim_time):
 # t0 锚定 reset 后初值,t = current_time - t0 为本次仿真已经过的秒数。
 t0 = world.current_time
 print(f"LOOP_START current_time={t0:.3f} duration={args.duration}", flush=True)
+# ---------------------------------------------------------------------------
+# Task 26 真因(2026-06-16):wheel-LS ω_z 的 RMS 几乎全是高频抖动——achieved 轮速读数在
+# 8×3 LS(b=v·[cosθ,sinθ])里被放大成 ω_z 抖。真值 ω_z 本身光滑(高频 RMS 仅 0.013),
+# 轮子也不纵向打滑(mu=1.5 时 speed_ratio=1.000;mu=0.01 时 1.8 才是真打滑)。抖源是轮速
+# velocity-drive 的阻尼 kd(见 set_gains):kd 过高 velocity 环对接触力扰动过敏 → 读数振铃。
+# 摩擦/碰撞/solver 对该抖几乎无效;唯一必需接触项是 mu≥~1(防纵向打滑)。
+# 控制环:每个 render 步(world.step(render=True) 推进 1/RENDER_HZ=0.1s,内含 20 个 200Hz
+# 物理子步)下发一次命令,命令在 20 子步内保持、velocity drive 有充分时间 settle。
+# (注:此 build 里 world.step(render=True) 一次推进整 render_dt,不能在 render=False 子步
+#  之间穿插单次 render=True 来提高命令率——那样 render=True 仍跳 0.1s、会扭曲 sim 时间轴
+#  并把雷达率腰斩。命令率=render 率=10Hz 是此 build 的硬约束。)
+# RENDER_HZ=10 不动 → AIRY 雷达每帧一整圈、相机 10Hz、joint_states/imu/odom 物理图节奏不变。
 _lidar_msg_count = 0
 while world.current_time - t0 < args.duration:
     world.step(render=True)

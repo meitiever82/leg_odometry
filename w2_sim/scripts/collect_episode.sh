@@ -9,6 +9,9 @@ SEED=$((1000 + EP))
 PKG="$(cd "$(dirname "$0")/.." && pwd)"
 OUT=$HOME/Documents/Datasets/w2_sim/$(printf 'episode_%04d' "$EP")
 mkdir -p "$OUT"
+# ros2 bag record 拒绝写已存在目录(实测 "Output folder ... already exists" 直接退出,
+# 旧 bag 原封不动 → 重采集静默失败,采到的还是上一版数据)。重采前先删旧 rosbag2。
+rm -rf "$OUT/rosbag2"
 
 set +u                       # ROS2 setup.bash 引用未定义变量,与 set -u 冲突
 source /opt/ros/jazzy/setup.bash

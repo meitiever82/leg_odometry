@@ -78,7 +78,10 @@ cfg.fix_base = False
 cfg.merge_fixed_joints = False      # 保留 rslidar/imu_link/camera_link 帧
 cfg.convex_decomp = False
 cfg.self_collision = False
-cfg.replace_cylinders_with_capsules = True  # 轮子碰撞用胶囊,滚动稳健
+# 轮子碰撞体:默认 cylinder(线接触,接地更像真实轮缘);W2_WHEEL_CAPSULE=1 退回 capsule。
+# 注:Task 26 实测碰撞几何对 wheel-LS ω_z 抖几乎无影响(抖源是轮速 velocity 环阻尼,
+# 见 w2_sim_app.py set_gains),cylinder 仅取其更贴真实的线接触;两者都需高摩擦材质防纵向打滑。
+cfg.replace_cylinders_with_capsules = os.environ.get("W2_WHEEL_CAPSULE", "0") == "1"
 cfg.make_default_prim = True
 cfg.default_drive_strength = 1e4            # steer 位置驱动刚度,运行时还会再调
 cfg.default_position_drive_damping = 1e3
