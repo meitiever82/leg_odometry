@@ -1,17 +1,20 @@
-"""AIRY 雷达点云(带 intensity)sidecar 发布节点。
+"""AIRY 雷达点云(x,y,z,intensity,ring,timestamp)sidecar 发布节点。
 
 Isaac 主程序(isaac/w2_sim_app.py)跑在 cp311 嵌入式 Python 里,无法干净地用
 系统 cp312 rclpy 直接发 PointCloud2(双 ROS 安装 ABI 冲突,详见 app 内注释)。
-故 Isaac 侧只把每帧 xyz+intensity 通过 UNIX 域 socket(SOCK_STREAM、长度前缀分帧)
-推过来;本节点跑在干净的系统 ROS2 环境,组 sensor_msgs/PointCloud2 发 /rslidar_points。
+故 Isaac 侧已把每帧 6 字段交错打包成真实 AIRY 的 26 字节/点布局,经 UNIX 域 socket
+(SOCK_STREAM、长度前缀分帧)推过来;本节点跑在干净的系统 ROS2 环境,直接把该原始
+载荷塞进 sensor_msgs/PointCloud2.data 发 /rslidar_points(无需重排,字节布局已对齐)。
 
 帧格式(与 app 内 _LIDAR_HDR 一致,小端):
-    magic(u32=0x52534C44) seq(u32) sim_time(f64) n_points(u32)
-    之后紧跟 n*4 个 float32:[x, y, z, intensity] × n。
-字段固定 [x,y,z,intensity](FLOAT32,offset 0/4/8/12,point_step=16),**不含 ring**
-(真实 AIRY 无 ring,bag 里的 ring 是驱动加的索引,本仿真不需要)。
+    magic(u32=0x52534C44) seq(u32) sim_time(f64) n_points(u32) point_step(u32)
+    之后紧跟 n*point_step 字节的已交错载荷,每点 26 字节:
+        x f32@0  y f32@4  z f32@8  intensity f32@12  ring u16@16  timestamp f64@18。
+字段对齐真实 AIRY(point_step=26):ring 是 AIRY 96 线的线号(0..95,= emitterId),
+timestamp 是绝对 sim-time(FLOAT64,= 帧 header + 圈内偏移,与 IMU/相机同 sim 钟,
+首点≈header.stamp)。这两个字段已由 app 算好,本节点不做任何加工。
 
-时间戳:用 Isaac 传来的 sim_time(秒),与 /clock、相机、imu 对齐。
+帧 header.stamp:用 Isaac 传来的 sim_time(秒),与 /clock、相机、imu 对齐。
 
 socket 路径默认 /tmp/w2_sim_lidar.sock,可用环境变量 W2_LIDAR_SOCK 覆盖。
 """
@@ -27,15 +30,17 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 
 SOCK_PATH = os.environ.get("W2_LIDAR_SOCK", "/tmp/w2_sim_lidar.sock")
-HDR = struct.Struct("<IIdI")  # magic, seq, sim_time, n_points
+HDR = struct.Struct("<IIdII")  # magic, seq, sim_time, n_points, point_step
 MAGIC = 0x52534C44
-POINT_STEP = 16  # 4 个 float32
+POINT_STEP = 26  # 4 个 float32 + 1 个 uint16 + 1 个 float64,对齐真实 AIRY
 
 FIELDS = [
     PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
     PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
     PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
     PointField(name="intensity", offset=12, datatype=PointField.FLOAT32, count=1),
+    PointField(name="ring", offset=16, datatype=PointField.UINT16, count=1),
+    PointField(name="timestamp", offset=18, datatype=PointField.FLOAT64, count=1),
 ]
 
 
@@ -111,11 +116,16 @@ class LidarPC2Publisher(Node):
             hdr = _recv_exact(conn, HDR.size)
             if hdr is None:
                 return
-            magic, seq, sim_time, n = HDR.unpack(hdr)
+            magic, seq, sim_time, n, point_step = HDR.unpack(hdr)
             if magic != MAGIC:
                 self.get_logger().error(f"bad magic {magic:#x}, dropping connection")
                 return
-            payload = _recv_exact(conn, n * POINT_STEP)
+            if point_step != POINT_STEP:
+                self.get_logger().error(
+                    f"point_step mismatch: got {point_step}, expected {POINT_STEP}; "
+                    "dropping connection")
+                return
+            payload = _recv_exact(conn, n * point_step)
             if payload is None:
                 return
             self._publish(sim_time, n, payload)

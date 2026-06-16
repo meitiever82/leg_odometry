@@ -203,8 +203,25 @@ lidar_rp = rep.create.render_product(lidar_prim.GetPath(), [1, 1])
 # 故每条消息=单渲染帧=完整 360° 半球扫描,与原 ROS2RtxLidarHelper(fullScan=True)
 # 同样对渲染欠载结构性免疫(质心帧间跳动 <0.1m)。
 # transformPoints=False:点保持在 lidar 局部系(frame_id=rslidar),与原行为一致。
+#
+# 补 ring + per-point timestamp(对齐真实 AIRY 的 6 字段 point_step=26 格式)。
+# 本构建 IsaacCreateRTXLidarScanBuffer.get_data() 实测各输出(probe 确认,详见任务报告):
+#   * elevation(outputElevation=True):每点仰角,**单位是度**(非文档说的 rad),
+#     与几何仰角 atan2(z,√(x²+y²)) 逐点完全相等(max abs diff=0.0)。AIRY 配置表
+#     omni:sensor:Core:emitterState:s001:elevationDeg 是 96 个均布值,正好
+#     elevation = ring × 0.947°(0, 0.947, …, 89.965)。所以
+#     **ring = round(elevation_deg / 0.947) clip[0,95] 即精确线号**(无需 emitterId)。
+#   * azimuth(outputAzimuth=True):每点方位角,**单位是度** [-180,180],逐点。
+#     用于 per-point timestamp 的圈内偏移。
+#   * emitterId(outputEmitterId=True):本构建返回**空数组**(不可用),故走 elevation。
+#   * timestamp(outputTimestamp=True):本构建返回数组**大小≠点数**(约半数,
+#     uint64 ns),不可逐点对齐,**弃用**;timestamp 改由 azimuth 算圈内偏移。
+# per-point timestamp = 本帧 sim_time(= header.stamp)+ 圈内偏移,偏移由方位角线性映射
+# 到 [0, 扫描周期 0.1s)。这样首点 ≈ header.stamp,帧内跨度 ≈ 0.1s,且与 /clock、
+# IMU、相机同一 sim 时钟(用户强调的关键)。实际 keys 可用 LIDAR_DUMP_KEYS=1 复核。
 _lidar_annot = rep.AnnotatorRegistry.get_annotator("IsaacCreateRTXLidarScanBuffer")
-_lidar_annot.initialize(outputIntensity=True, transformPoints=False)
+_lidar_annot.initialize(outputIntensity=True, transformPoints=False,
+                        outputElevation=True, outputAzimuth=True)
 _lidar_annot.attach([lidar_rp.path])
 # Isaac RTX intensity 是反射率 [0,1];真实 AIRY 是 [1,255](实测 bag:min0 max255
 # mean25.8 p95=91,~75% 非零)。线性缩放 ×255 后下限 clip 到 1,量级与真实对齐。
@@ -405,11 +422,26 @@ import socket  # noqa: E402
 import struct  # noqa: E402
 
 _LIDAR_SOCK_PATH = os.environ.get("W2_LIDAR_SOCK", "/tmp/w2_sim_lidar.sock")
-# 帧头:magic(u32) seq(u32) sim_time(f64) n_points(u32) —— 之后 n*4 个 float32。
-_LIDAR_HDR = struct.Struct("<IIdI")
+# 帧头:magic(u32) seq(u32) sim_time(f64) n_points(u32) point_step(u32)。
+# 之后紧跟 n*point_step 字节的已交错打包载荷,每点 26 字节,对齐真实 AIRY:
+#   x f32@0  y f32@4  z f32@8  intensity f32@12  ring u16@16  timestamp f64@18。
+# timestamp 已是绝对 sim-time(= 本帧 sim_time + 圈内偏移),sidecar 无需再加工。
+_LIDAR_HDR = struct.Struct("<IIdII")
 _LIDAR_MAGIC = 0x52534C44  # 'RSLD'
+_LIDAR_POINT_STEP = 26
+_LIDAR_DUMP_KEYS = os.environ.get("LIDAR_DUMP_KEYS", "0") == "1"
 _lidar_sock = None
 _lidar_seq = 0
+_lidar_keys_dumped = False
+
+# numpy structured dtype 用于把混合类型字段交错打包成真实 AIRY 的 26 字节/点布局。
+# 不能用单一 float32 (n,6):ring 是 u16、timestamp 是 f64,类型/字宽不同。
+_LIDAR_REC_DTYPE = np.dtype({
+    "names": ["x", "y", "z", "intensity", "ring", "timestamp"],
+    "formats": [np.float32, np.float32, np.float32, np.float32, np.uint16, np.float64],
+    "offsets": [0, 4, 8, 12, 16, 18],
+    "itemsize": 26,
+}, align=False)
 
 
 def _lidar_connect():
@@ -429,11 +461,24 @@ def _lidar_connect():
 
 
 def publish_lidar(sim_time):
-    """从标注器取一整圈 xyz+intensity,经 socket 发给 sidecar(含 intensity,无 ring)。"""
-    global _lidar_sock, _lidar_seq
+    """从标注器取一整圈 xyz+intensity+ring+per-point-timestamp,交错打包成真实 AIRY
+    的 26 字节/点布局,经 socket 发给 sidecar。
+
+    ring 来源:elevation(度)→ round(el_deg/0.947) clip[0,95](AIRY 96 线均布,精确线号)。
+    timestamp 来源:azimuth(度 [-180,180])归一化到 [0,1)×扫描周期(0.1s)得圈内偏移,
+      加帧 sim_time 基准得绝对 sim-time(与 /clock/IMU/相机同钟,首点≈header.stamp)。
+    """
+    global _lidar_sock, _lidar_seq, _lidar_keys_dumped
     data = _lidar_annot.get_data()
     if not isinstance(data, dict):
         return 0
+    if _LIDAR_DUMP_KEYS and not _lidar_keys_dumped:
+        _lidar_keys_dumped = True
+        info = []
+        for k, v in data.items():
+            arr = np.asarray(v) if not isinstance(v, np.ndarray) else v
+            info.append(f"{k}{getattr(arr,'shape',None)}/{getattr(arr,'dtype',None)}")
+        print("LIDAR_GET_DATA_KEYS:", " ".join(info), flush=True)
     xyz = data.get("data")
     inten = data.get("intensity")
     if xyz is None or inten is None:
@@ -445,16 +490,45 @@ def publish_lidar(sim_time):
     n = int(xyz.shape[0])
     # Isaac 反射率 [0,1] → AIRY 量级 [1,255]:×255 后 clip 到 [1,255]。
     inten = np.clip(inten * LIDAR_INTENSITY_SCALE, 1.0, 255.0).astype(np.float32)
-    buf = np.empty((n, 4), dtype=np.float32)
-    buf[:, 0:3] = xyz
-    buf[:, 3] = inten
-    payload = buf.tobytes()
+
+    # ---- ring(UINT16,0..95):elevation(度)→ round(/0.947),AIRY 96 线精确线号 ----
+    elev = data.get("elevation")
+    if elev is not None and np.asarray(elev).ravel().shape[0] == n:
+        el_deg = np.asarray(elev, dtype=np.float64).ravel()  # 本构建 elevation 已是度
+    else:
+        # 兜底:从 xyz 反算仰角(度)。
+        el_deg = np.degrees(np.arctan2(
+            xyz[:, 2], np.sqrt(xyz[:, 0] ** 2 + xyz[:, 1] ** 2)))
+    ring = np.clip(np.round(el_deg / 0.947), 0, 95).astype(np.uint16)
+
+    # ---- per-point timestamp(绝对 sim-time,FLOAT64):azimuth(度)→ 圈内偏移 ----
+    SCAN_PERIOD = 1.0 / RENDER_HZ  # 0.1s = 一整圈周期
+    az = data.get("azimuth")
+    if az is not None and np.asarray(az).ravel().shape[0] == n:
+        a_deg = np.asarray(az, dtype=np.float64).ravel()  # 本构建 azimuth 已是度 [-180,180]
+    else:
+        a_deg = np.degrees(np.arctan2(
+            xyz[:, 1].astype(np.float64), xyz[:, 0].astype(np.float64)))
+    # 方位角 [-180,180] 归一化到 [0,1) × 扫描周期 → 圈内偏移 [0, 0.1)。
+    off = ((a_deg + 180.0) / 360.0) * SCAN_PERIOD
+    ts_abs = float(sim_time) + off
+
+    # ---- 交错打包 26 字节/点 ----
+    rec = np.empty(n, dtype=_LIDAR_REC_DTYPE)
+    rec["x"] = xyz[:, 0]
+    rec["y"] = xyz[:, 1]
+    rec["z"] = xyz[:, 2]
+    rec["intensity"] = inten
+    rec["ring"] = ring
+    rec["timestamp"] = ts_abs
+    payload = rec.tobytes()
     s = _lidar_connect()
     if s is None:
         return 0
     _lidar_seq += 1
     try:
-        s.sendall(_LIDAR_HDR.pack(_LIDAR_MAGIC, _lidar_seq, float(sim_time), n) + payload)
+        s.sendall(_LIDAR_HDR.pack(_LIDAR_MAGIC, _lidar_seq, float(sim_time),
+                                  n, _LIDAR_POINT_STEP) + payload)
     except (BrokenPipeError, ConnectionResetError, OSError) as e:
         print(f"WARN lidar sock send failed ({e}); will reconnect", file=sys.stderr, flush=True)
         try:
