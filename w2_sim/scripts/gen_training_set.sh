@@ -11,10 +11,16 @@ DATA=$HOME/Documents/Datasets/w2_sim
 LOG=$DATA/TRAINING_GEN_LOG.txt
 export ISAACSIM_DIR=$HOME/Documents/GitHub/system/IsaacSim/_build/linux-aarch64/release
 
-# 候选场景(已验证 gridroom/warehouse;其余轻量 Grid 场景试,失败自动丢)。
-# 重场景 office/hospital/digital_twin 故意排除(加载期 MDL 材质编译超时)。
-SCENES=(gridroom warehouse gridroom_black default_environment full_warehouse)
+# 候选场景:轻场景(gridroom/warehouse 已验证 + 其余 Grid)+ 重场景(office/hospital/
+# digital_twin)。重场景加载期 MDL 材质编译很久,但 Omniverse 编译后缓存——所以每个场景
+# 第一次给超长超时(WARMUP_TO,让 MDL 编译完+缓存),之后用正常超时(NORMAL_TO,缓存后快)。
+# 第一次就超时 → 丢弃;预热成功但之后仍超时(缓存没帮上)→ 也丢弃。
+SCENES=(gridroom warehouse gridroom_black default_environment full_warehouse \
+        office hospital digital_twin)
+NORMAL_TO=1000      # 正常超时(s):光场景 + 已预热重场景
+WARMUP_TO=5400      # 首次超时(s,90min):让重场景 MDL 编译完并缓存
 declare -A BAD=()
+declare -A WARMED=()
 
 START=$(date +%s)
 good=0; i=0
@@ -33,8 +39,10 @@ while [ "$good" -lt "$TARGET" ]; do
 
   OUT=$DATA/$(printf 'episode_%04d' "$EP")
   rm -rf "$OUT"
+  # 首次该场景给超长超时预热(让 MDL 编译完+缓存),已预热用正常超时
+  if [ "${WARMED[$scene]:-0}" = "1" ]; then to=$NORMAL_TO; else to=$WARMUP_TO; fi
   t0=$(date +%s)
-  timeout 1000 "$PKG/scripts/collect_episode.sh" "$EP" "$DUR" "$scene" > /tmp/gen_ep${EP}.log 2>&1
+  timeout "$to" "$PKG/scripts/collect_episode.sh" "$EP" "$DUR" "$scene" > /tmp/gen_ep${EP}.log 2>&1
   rc=$?
   dt=$(( $(date +%s) - t0 ))
 
@@ -71,17 +79,19 @@ print(f"{'GOOD' if ok else 'BAD'}|path={path:.1f}m|z范围={zrange:.2f}|κ={kap}
 PY
 )
     verdict=${res%%|*}
+    WARMED[$scene]=1   # 成功产出 → 该场景已预热(MDL 已缓存),后续用正常超时
     if [ "$verdict" = "GOOD" ]; then
       good=$(( good + 1 ))
-      echo "[$good/$TARGET] EP$EP $scene ($((dt/60))min) $res" >> "$LOG"
+      warm=$([ "$dt" -gt "$NORMAL_TO" ] && echo " [预热]" || echo "")
+      echo "[$good/$TARGET] EP$EP $scene ($((dt/60))min)$warm $res" >> "$LOG"
       EP=$(( EP + 1 ))
     else
       echo "[skip] EP$EP $scene 数据异常: $res(已删)" >> "$LOG"
       rm -rf "$OUT"; EP=$(( EP + 1 ))
     fi
   else
-    # 加载失败/超时 → 删空目录,标记该场景失败,不再用
-    echo "[场景失败] EP$EP $scene rc=$rc ${dt}s 未产出(加载/MDL超时),丢弃该场景" >> "$LOG"
+    # 未产出:首次(未预热)超时=该重场景连 MDL 编译都跑不完→丢弃;已预热仍超时=缓存没帮上→也丢弃
+    echo "[场景失败] EP$EP $scene rc=$rc $((dt/60))min 未产出(预热=${WARMED[$scene]:-0}),丢弃该场景" >> "$LOG"
     rm -rf "$OUT"; BAD[$scene]=1
     # 若所有场景都失败,停
     allbad=1; for s in "${SCENES[@]}"; do [ "${BAD[$s]:-0}" = "1" ] || allbad=0; done
