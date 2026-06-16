@@ -21,15 +21,85 @@ import os
 import sys
 from pathlib import Path
 
+# ===========================================================================
+# 场景注册表(多场景支持,2026-06-16)。每个具名场景映射到:
+#   * usd:   资产服务器相对路径(get_assets_root_path() 之后拼接);None=用
+#            default_ground_plane(ground 场景,免云资产)。
+#   * spawn: 机器人 spawn 位置 (x,y,z)。不同场景地面高度/原点自由空间不同,
+#            原点可能落在墙里/桌子里/悬空,故每个场景单独配 spawn,避开障碍。
+#   * box:   safe-box [xmin,xmax,ymin,ymax],机器人出界即朝场景中心回驶。围绕
+#            spawn 给一块该场景已验证的空旷自由空间(避免驶入墙/货架)。
+# warehouse / ground 行为保持与历史一致(spawn z=0.3,box [-4,4,-6,6])。
+# ===========================================================================
+SCENE_REGISTRY = {
+    # 现用仓库:Simple_Warehouse,原点在主通道中段,空旷。历史默认,勿动。
+    "warehouse": {
+        "usd": "/Isaac/Environments/Simple_Warehouse/warehouse.usd",
+        "spawn": (0.0, 0.0, 0.3),
+        "box": [-4.0, 4.0, -6.0, 6.0],
+    },
+    # 平地:default_ground_plane,无云资产、无结构(雷达只见地面)。冒烟/兜底用。
+    "ground": {
+        "usd": None,
+        "spawn": (0.0, 0.0, 0.3),
+        "box": [-4.0, 4.0, -6.0, 6.0],
+    },
+    # 办公室:Office/office.usd。原点在开放区。
+    "office": {
+        "usd": "/Isaac/Environments/Office/office.usd",
+        "spawn": (0.0, 0.0, 0.3),
+        "box": [-3.0, 3.0, -3.0, 3.0],
+    },
+    # 医院:Hospital/hospital.usd。大走廊场景。
+    "hospital": {
+        "usd": "/Isaac/Environments/Hospital/hospital.usd",
+        "spawn": (0.0, 0.0, 0.3),
+        "box": [-4.0, 4.0, -4.0, 4.0],
+    },
+    # 网格房(弯墙):Grid/gridroom_curved.usd。封闭房间,结构丰富,地面 z=0。
+    "gridroom": {
+        "usd": "/Isaac/Environments/Grid/gridroom_curved.usd",
+        "spawn": (0.0, 0.0, 0.3),
+        "box": [-4.0, 4.0, -4.0, 4.0],
+    },
+    # 数字孪生小仓库:Digital_Twin_Warehouse/small_warehouse_digital_twin.usd。
+    "digital_twin": {
+        "usd": "/Isaac/Environments/Digital_Twin_Warehouse/small_warehouse_digital_twin.usd",
+        "spawn": (0.0, 0.0, 0.3),
+        "box": [-4.0, 4.0, -4.0, 4.0],
+    },
+    # 简单房间:Simple_Room/simple_room.usd。小封闭房间 + 桌子,原点可能压桌,
+    # 验证阶段按需调 spawn。
+    "simple_room": {
+        "usd": "/Isaac/Environments/Simple_Room/simple_room.usd",
+        "spawn": (0.0, 0.0, 0.3),
+        "box": [-2.5, 2.5, -2.5, 2.5],
+    },
+    # 完整仓库:Simple_Warehouse/full_warehouse.usd。更密集货架。
+    "full_warehouse": {
+        "usd": "/Isaac/Environments/Simple_Warehouse/full_warehouse.usd",
+        "spawn": (0.0, 0.0, 0.3),
+        "box": [-4.0, 4.0, -6.0, 6.0],
+    },
+}
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, required=True)
 parser.add_argument("--duration", type=float, required=True)
 parser.add_argument("--usd", default=str(Path.home() / "rtabmap_ws/w2/usd/w2_swerve.usd"))
-parser.add_argument("--env", default="warehouse", choices=["warehouse", "ground"])
+parser.add_argument("--env", default="warehouse", choices=sorted(SCENE_REGISTRY.keys()))
 parser.add_argument("--gui", action="store_true")
-parser.add_argument("--safe-box", type=float, nargs=4, default=[-4.0, 4.0, -6.0, 6.0],
-                    help="xmin xmax ymin ymax,出界即朝中心回驶")
+parser.add_argument("--spawn", type=float, nargs=3, default=None,
+                    help="x y z spawn 覆盖(默认用场景注册表值)")
+parser.add_argument("--safe-box", type=float, nargs=4, default=None,
+                    help="xmin xmax ymin ymax,出界即朝中心回驶(默认用场景注册表值)")
 args = parser.parse_args()
+
+# 解析本场景的 spawn / safe-box(命令行覆盖优先,否则用注册表默认)。
+_SCENE = SCENE_REGISTRY[args.env]
+SPAWN_XYZ = list(args.spawn) if args.spawn is not None else list(_SCENE["spawn"])
+if args.safe_box is None:
+    args.safe_box = list(_SCENE["box"])
 
 from isaacsim import SimulationApp
 
@@ -75,22 +145,26 @@ CAMERA_FOCAL_LENGTH_MM = 18.0  # ~50° HFoV(aperture 默认 20.955mm),近似前�
 world = World(stage_units_in_meters=1.0,
               physics_dt=1.0 / PHYS_HZ, rendering_dt=1.0 / RENDER_HZ)
 
-# ---- 场景 ----
+# ---- 场景(从注册表加载)----
 GROUND_PRIMS = []  # 用于绑高摩擦材质的地面 prim path(随场景而定)
-if args.env == "warehouse":
-    assets = get_assets_root_path()
-    if assets:
-        add_reference_to_stage(
-            usd_path=assets + "/Isaac/Environments/Simple_Warehouse/warehouse.usd",
-            prim_path="/World/env")
-        GROUND_PRIMS.append("/World/env")
-    else:
-        print("WARN: 云资产不可达,退回平地", file=sys.stderr, flush=True)
-        world.scene.add_default_ground_plane()
-        GROUND_PRIMS.append("/World/defaultGroundPlane")
-else:
+_env_usd_rel = _SCENE["usd"]
+if _env_usd_rel is None:
+    # ground:default_ground_plane,无云资产。
     world.scene.add_default_ground_plane()
     GROUND_PRIMS.append("/World/defaultGroundPlane")
+    print(f"SCENE: env={args.env} default_ground_plane spawn={SPAWN_XYZ} box={args.safe_box}",
+          flush=True)
+else:
+    assets = get_assets_root_path()
+    if assets:
+        add_reference_to_stage(usd_path=assets + _env_usd_rel, prim_path="/World/env")
+        GROUND_PRIMS.append("/World/env")
+        print(f"SCENE: env={args.env} usd={_env_usd_rel} spawn={SPAWN_XYZ} "
+              f"box={args.safe_box}", flush=True)
+    else:
+        print(f"WARN: 云资产不可达(env={args.env}),退回平地", file=sys.stderr, flush=True)
+        world.scene.add_default_ground_plane()
+        GROUND_PRIMS.append("/World/defaultGroundPlane")
 
 # ---- 机器人 ----
 add_reference_to_stage(usd_path=args.usd, prim_path="/World/w2")
@@ -121,7 +195,7 @@ RSLIDAR_LINK = LINK_PARENT + "/rslidar"
 print("LINK_PARENT:", LINK_PARENT, flush=True)
 
 robot = SingleArticulation(ROBOT_ROOT, name="w2",
-                           position=np.array([0.0, 0.0, 0.3]))
+                           position=np.array(SPAWN_XYZ, dtype=float))
 world.scene.add(robot)
 
 # ===========================================================================
@@ -697,9 +771,12 @@ while world.current_time - t0 < args.duration:
     cmd = profile[min(int(t * CMD_HZ), len(profile) - 1), 1:]
     pos, quat = robot.get_world_pose()
     if not (box[0] < pos[0] < box[1] and box[2] < pos[1] < box[3]):
-        # 出安全框:世界系朝原点 0.5m/s,转到 base 系
+        # 出安全框:世界系朝 box 中心 0.5m/s,转到 base 系(box 中心=该场景已验证的
+        # 空旷区中点;off-origin spawn 场景朝原点会驶入墙,故用 box 中心)。
         yaw = yaw_of(quat)
-        d = -pos[:2] / max(np.linalg.norm(pos[:2]), 1e-6) * 0.5
+        ctr = np.array([(box[0] + box[1]) * 0.5, (box[2] + box[3]) * 0.5])
+        delta = ctr - pos[:2]
+        d = delta / max(np.linalg.norm(delta), 1e-6) * 0.5
         c, s = np.cos(-yaw), np.sin(-yaw)
         cmd = np.array([c * d[0] - s * d[1], s * d[0] + c * d[1], 0.0])
     ang, spd = inverse_kinematics(cmd[0], cmd[1], cmd[2], prev_angles=prev_angles)
