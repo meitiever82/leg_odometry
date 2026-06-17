@@ -7,7 +7,7 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lwt.dataset import TwistDataset, stratified_split
 from lwt.model import TwistTCN
-from lwt.losses import weighted_mse, gaussian_nll
+from lwt.losses import weighted_mse, gaussian_nll, batch_bias_penalty
 
 def episode_list(cache_root):
     eps = []
@@ -47,14 +47,17 @@ def main():
     xs, _, lss = next(iter(Ltr))
     try: writer.add_graph(m, (xs.to(dev), lss.to(dev)))
     except Exception as e: print("add_graph skip:", e)
+    bp_w = cfg["train"]["bias_penalty"]
     best = 1e9
     for ep in range(a.epochs):
-        m.train(); tl = []
+        m.train(); tl = []; bpl = []
         for x, y, ls in Ltr:
             x, y, ls = x.to(dev), y.to(dev), ls.to(dev)
             tw, lv = m(x, ls)
-            loss = weighted_mse(tw, y, w) if ep < cfg["train"]["mse_warmup_epochs"] else gaussian_nll(tw, y, lv, w)
-            opt.zero_grad(); loss.backward(); opt.step(); tl.append(loss.item())
+            base = weighted_mse(tw, y, w) if ep < cfg["train"]["mse_warmup_epochs"] else gaussian_nll(tw, y, lv, w)
+            bp = batch_bias_penalty(tw, y, bp_w, w)
+            loss = base + bp
+            opt.zero_grad(); loss.backward(); opt.step(); tl.append(loss.item()); bpl.append(bp.item())
         m.eval(); ve = []
         with torch.no_grad():
             for x, y, ls in Lva:
@@ -63,6 +66,7 @@ def main():
         vrmse = np.sqrt(np.mean(ve, 0))
         print(f"ep{ep} val twist RMSE vx={vrmse[0]:.4f} vy={vrmse[1]:.4f} wz={vrmse[2]:.4f}")
         writer.add_scalar("loss/train", float(np.mean(tl)), ep)
+        writer.add_scalar("loss/bias_penalty", float(np.mean(bpl)), ep)
         for ax, nm in enumerate(["vx", "vy", "wz"]):
             writer.add_scalar(f"val_rmse/{nm}", float(vrmse[ax]), ep)
         for name, p in m.named_parameters():

@@ -9,5 +9,5 @@ kappa_aug:
   steer_bias_max_deg: 1.0   # 每轮额外 δ ~ U(±max)
   speed_scale_std: 0.015    # 每轮额外 s ~ N(1, std)
 model: {tcn_channels: 48, tcn_layers: 4, kernel: 3, dropout: 0.1}
-train: {batch: 256, lr: 1.0e-3, epochs: 60, mse_warmup_epochs: 15, device: cuda}
+train: {batch: 256, lr: 1.0e-3, epochs: 60, mse_warmup_epochs: 15, device: cuda, bias_penalty: 1.0}
 geom: {wheelbase: 0.435, track: 0.400, wheel_radius: 0.075}
