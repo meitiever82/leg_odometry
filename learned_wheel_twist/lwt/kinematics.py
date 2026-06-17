@@ -48,20 +48,40 @@ def ape_percent(traj, truth):
     rmse = np.sqrt(np.mean((ex-tx)**2 + (ey-ty)**2))
     return 100.0 * rmse / max(_path_len(np.column_stack([tx, ty])), 1e-9)
 
+def _local_heading(P, s, i, look):
+    """轨迹 P (N,2) 在第 i 点的切线航向:弧长前瞻 look 米找首个 k>i,φ=atan2(dy,dx);无则退 i+1。"""
+    k = i + 1
+    while k < len(s) and s[k] - s[i] < look:
+        k += 1
+    if k >= len(P):
+        k = min(i + 1, len(P) - 1)
+    return float(np.arctan2(P[k, 1] - P[i, 1], P[k, 0] - P[i, 0]))
+
+def _Rneg(phi):
+    """R(-φ) = [[cosφ, sinφ],[-sinφ, cosφ]],把世界位移旋入 i 点局部航向系。"""
+    c, sn = np.cos(phi), np.sin(phi)
+    return np.array([[c, sn], [-sn, c]])
+
 def rpe_segment(traj, truth, seg_len=10.0):
-    """分段相对位姿误差:沿 truth 每累计 seg_len 米取一段,比 traj 与 truth 在该段的相对位移,
-    返回相对位移误差的 RMSE / seg_len 的百分比(航位推算对长程更公平的指标)。"""
+    """分段相对位姿误差(对全局刚体变换不变):沿 truth 每累计 seg_len 米取一段 i→j,
+    将两条轨迹各自的段位移分别旋入 i 点本轨迹切线航向定义的局部系后再比差,
+    返回相对位移误差 RMSE / seg_len 的百分比(航位推算对长程更公平、且不受激光世界系任意旋转影响)。"""
     tx = np.interp(traj[:, 0], truth[:, 0], truth[:, 1]); ty = np.interp(traj[:, 0], truth[:, 0], truth[:, 2])
     T = np.column_stack([tx, ty]); E = traj[:, 1:3]
-    s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(T, axis=0), axis=1))])
+    sT = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(T, axis=0), axis=1))])
+    sE = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(E, axis=0), axis=1))])
+    look = min(1.0, seg_len * 0.2)
     errs = []; j = 0
-    for i in range(len(s)):
-        while j < len(s) and s[j] - s[i] < seg_len:
+    for i in range(len(sT)):
+        while j < len(sT) and sT[j] - sT[i] < seg_len:
             j += 1
-        if j >= len(s):
+        if j >= len(sT):
             break
-        dT = T[j] - T[i]; dE = E[j] - E[i]
-        errs.append(np.linalg.norm(dE - dT))
+        phiT = _local_heading(T, sT, i, look)
+        phiE = _local_heading(E, sE, i, look)
+        dT_local = _Rneg(phiT) @ (T[j] - T[i])
+        dE_local = _Rneg(phiE) @ (E[j] - E[i])
+        errs.append(np.linalg.norm(dE_local - dT_local))
     if not errs:
         return 0.0
     return 100.0 * float(np.sqrt(np.mean(np.square(errs)))) / seg_len

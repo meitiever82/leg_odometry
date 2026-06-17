@@ -38,3 +38,41 @@ def test_rpe_zero_identical():
     t = np.arange(0, 10, 0.02); tw = np.zeros((len(t), 3)); tw[:, 0] = 0.5
     traj = integrate_twist(t, tw)
     assert rpe_segment(traj, traj[:, :3], seg_len=2.0) < 1e-6
+
+def _gentle_arc_truth(n=120):
+    """Build a (n,3) truth [t,x,y] as a gentle curving path (heading varies)."""
+    t = np.linspace(0, 60, n)
+    ds = (t[1] - t[0]) * 0.5            # ~0.25 m per step
+    heading = 0.3 * np.sin(np.linspace(0, 2*np.pi, n))  # gently curving heading
+    dx = ds * np.cos(heading); dy = ds * np.sin(heading)
+    x = np.concatenate([[0.0], np.cumsum(dx[:-1])])
+    y = np.concatenate([[0.0], np.cumsum(dy[:-1])])
+    return np.column_stack([t, x, y])
+
+def _rot(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+def test_rpe_invariant_to_global_rotation():
+    truth = _gentle_arc_truth()
+    # rigid transform: rotate (x,y) by 1.0 rad about the first point + translate
+    p0 = truth[0, 1:3]
+    R = _rot(1.0)
+    xy = (truth[:, 1:3] - p0) @ R.T + p0 + np.array([10.0, -5.0])
+    yaw = np.zeros((len(truth), 1))
+    traj = np.column_stack([truth[:, 0], xy, yaw])   # (N,4)
+    assert rpe_segment(traj, truth, 10.0) < 1.0
+
+def test_rpe_identity_zero():
+    truth = _gentle_arc_truth()
+    yaw = np.zeros((len(truth), 1))
+    traj = np.column_stack([truth[:, 0], truth[:, 1:3], yaw])  # (N,4)
+    assert rpe_segment(traj, truth, 10.0) < 1e-6
+
+def test_rpe_detects_scale_drift():
+    truth = _gentle_arc_truth()
+    p0 = truth[0, 1:3]
+    xy = (truth[:, 1:3] - p0) * 1.1 + p0   # genuine shape drift (not rigid)
+    yaw = np.zeros((len(truth), 1))
+    traj = np.column_stack([truth[:, 0], xy, yaw])
+    assert rpe_segment(traj, truth, 10.0) > 5.0
