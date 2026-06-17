@@ -29,6 +29,42 @@ def test_dataset_with_imu_9ch():
         assert y.shape == (3,) and ls.shape == (3,)
 
 
+def test_dataset_imu_wz_prior():
+    # phase-2b: imu_wz_prior=True + with_imu → ls_prior = [ls_vx, ls_vy, imu_yawrate(窗末)].
+    # 先验 wz 用窗末重力投影 yaw-rate(未标准化),vx/vy 仍用 LS。
+    from lwt.kinematics import ls_twist
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        # 不增广 + 不标准化:可精确对照窗末原始值。
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=False,
+                          with_imu=True, imu_wz_prior=True)
+        d = np.load(os.path.join(td, "e.npz"))
+        i = 7
+        x, y, ls = ds[i]
+        w_end = i + 25 - 1   # 窗末原始帧索引
+        ls_ref = ls_twist(d["steer"][w_end], d["speed"][w_end])
+        # vx/vy 来自 LS
+        np.testing.assert_allclose(ls[0].item(), ls_ref[0], rtol=1e-5)
+        np.testing.assert_allclose(ls[1].item(), ls_ref[1], rtol=1e-5)
+        # wz 来自窗末 imu_yawrate(而非 LS wz)
+        np.testing.assert_allclose(ls[2].item(), d["imu_yawrate"][w_end, 0], rtol=1e-5)
+        assert abs(ls[2].item() - ls_ref[2]) > 1e-9  # 与 LS wz 确实不同
+
+
+def test_dataset_imu_wz_prior_requires_imu():
+    # imu_wz_prior 仅在 with_imu 时生效;wheel-only(in_ch=8)路径不受影响。
+    from lwt.kinematics import ls_twist
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=False,
+                          with_imu=False, imu_wz_prior=True)
+        d = np.load(os.path.join(td, "e.npz"))
+        i = 3
+        _, _, ls = ds[i]
+        ls_ref = ls_twist(d["steer"][i+24], d["speed"][i+24])
+        np.testing.assert_allclose(ls[2].item(), ls_ref[2], rtol=1e-5)  # 仍是 LS wz
+
+
 def test_dataset_no_aug_deterministic():
     with tempfile.TemporaryDirectory() as td:
         _mk(td, "e.npz")

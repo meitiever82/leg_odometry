@@ -50,8 +50,12 @@ class TwistDataset(torch.utils.data.Dataset):
     """整合:多 episode 滑窗 + 可选 κ增广 + LS先验 + (C,T) 排布。返回 (x[C,T], y[3], ls_prior[3])。
     增广在 __getitem__ 内对原始窗逐样本随机施加(每次不同),真值 y 不变。"""
     def __init__(self, npz_paths, window=25, augment=False, with_imu=False,
-                 steer_bias_max_deg=1.0, speed_scale_std=0.015, norm=None, seed=0):
+                 steer_bias_max_deg=1.0, speed_scale_std=0.015, norm=None, seed=0,
+                 imu_wz_prior=False):
         self.window, self.augment, self.with_imu = window, augment, with_imu
+        # phase-2b: imu_wz_prior → 残差先验的 wz 分量改用窗末 imu_yawrate(无偏陀螺),
+        # 取代 κ-偏置的轮速 LS wz;vx/vy 仍用 LS。仅在 with_imu(in_ch=9)时生效。
+        self.imu_wz_prior = imu_wz_prior and with_imu
         self.sbm, self.sss = steer_bias_max_deg, speed_scale_std
         self.X, self.Y = [], []
         for p in npz_paths:
@@ -73,6 +77,8 @@ class TwistDataset(torch.utils.data.Dataset):
         if self.augment:
             w = augment_kappa(w, self.sbm, self.sss, self.rng)
         ls = np.array(ls_twist(w[-1, :4], w[-1, 4:8]))
+        if self.imu_wz_prior:
+            ls[2] = w[-1, 8]   # 窗末 imu_yawrate(第 9 通道,未标准化)取代 LS wz
         if self.norm is not None:
             w = (w - self.norm[0]) / self.norm[1]
         x = torch.from_numpy(w.T.copy()).float()

@@ -23,9 +23,15 @@ def main():
     cfg = yaml.safe_load(cfg_path.read_text())
     ap = argparse.ArgumentParser()
     ap.add_argument("--with-imu", action="store_true")
+    ap.add_argument("--imu-wz-prior", action="store_true",
+                    help="phase-2b: 残差先验 wz 用窗末 imu_yawrate 取代 LS wz(需 --with-imu)")
     ap.add_argument("--epochs", type=int, default=cfg["train"]["epochs"])
     ap.add_argument("--out", default="learned_wheel_twist/runs/lwt_wheel")
     a = ap.parse_args()
+    imu_wz_prior = a.imu_wz_prior and a.with_imu
+    cfg["model"]["imu_wz_prior"] = imu_wz_prior   # 存入 ckpt cfg,供 eval/eval_real 复现
+    if a.imu_wz_prior and not a.with_imu:
+        print("[警告] --imu-wz-prior 需配 --with-imu,wheel-only 下忽略。")
     dev = cfg["train"]["device"] if torch.cuda.is_available() else "cpu"
     eps = episode_list(cfg["data"]["cache_root"])
     tr, va, te = stratified_split(eps, (cfg["split"]["train"], cfg["split"]["val"], cfg["split"]["test"]), cfg["split"]["seed"])
@@ -33,9 +39,11 @@ def main():
     W = cfg["data"]["window"]; ka = cfg["kappa_aug"]
     in_ch = 9 if a.with_imu else 8   # phase-2: 8 wheel + 1 imu_yawrate
     dtr = TwistDataset([p for p, _ in tr], W, augment=True, with_imu=a.with_imu,
-                       steer_bias_max_deg=ka["steer_bias_max_deg"], speed_scale_std=ka["speed_scale_std"])
+                       steer_bias_max_deg=ka["steer_bias_max_deg"], speed_scale_std=ka["speed_scale_std"],
+                       imu_wz_prior=imu_wz_prior)
     norm = dtr.fit_norm()
-    dva = TwistDataset([p for p, _ in va], W, augment=False, with_imu=a.with_imu, norm=norm)
+    dva = TwistDataset([p for p, _ in va], W, augment=False, with_imu=a.with_imu, norm=norm,
+                       imu_wz_prior=imu_wz_prior)
     ystd = dtr.Y.std(0) + 1e-6; w = torch.tensor(1.0/ystd, dtype=torch.float32, device=dev)
     Ltr = torch.utils.data.DataLoader(dtr, batch_size=cfg["train"]["batch"], shuffle=True, num_workers=4)
     Lva = torch.utils.data.DataLoader(dva, batch_size=512)

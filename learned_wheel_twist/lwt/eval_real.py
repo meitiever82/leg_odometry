@@ -27,11 +27,15 @@ def main():
         feat += [d["imu_yawrate"]]   # phase-2 单通道重力投影 yaw-rate
     F = np.concatenate(feat, axis=1).astype(np.float32)  # (N, C)
     norm = ck["norm"]
+    iwp = ck["cfg"]["model"].get("imu_wz_prior", False)   # phase-2b
+    if iwp: print("  [imu_wz_prior] 残差先验 wz = imu_yawrate")
     preds = []
     with torch.no_grad():
         for i in range(len(F) - W + 1):
             w = F[i:i+W].copy()  # (W, C)
             lsp = np.array(ls_twist(w[-1, :4], w[-1, 4:8]), dtype=np.float32)
+            if iwp:
+                lsp[2] = w[-1, 8]   # 窗末 imu_yawrate(第 9 通道,未标准化)
             if norm is not None:
                 w = (w - norm[0]) / norm[1]
             x = torch.from_numpy(w.T.copy()).float()[None].to(dev)

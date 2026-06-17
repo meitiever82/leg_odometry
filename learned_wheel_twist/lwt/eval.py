@@ -9,9 +9,10 @@ from lwt.dataset import TwistDataset
 from lwt.model import TwistTCN
 from lwt.kinematics import ls_twist, integrate_twist, ape_percent, rpe_segment
 
-def eval_episode(npz, m, norm, in_ch, W, dev):
+def eval_episode(npz, m, norm, in_ch, W, dev, imu_wz_prior=False):
     d = np.load(npz); t = d["t_wheel"]
-    ds = TwistDataset([npz], W, augment=False, with_imu=(in_ch == 9), norm=norm)
+    ds = TwistDataset([npz], W, augment=False, with_imu=(in_ch == 9), norm=norm,
+                      imu_wz_prior=imu_wz_prior)
     tw_gt = np.stack([d["gt_vx"], d["gt_vy"], d["gt_wz"]], 1)[W-1:]
     tt = t[W-1:]
     ls = ls_twist(d["steer"][W-1:], d["speed"][W-1:])
@@ -37,7 +38,9 @@ def main():
     m = TwistTCN(ck["in_ch"], ck["cfg"]["model"]["tcn_channels"], ck["cfg"]["model"]["tcn_layers"],
                  ck["cfg"]["model"]["kernel"]).to(dev); m.load_state_dict(ck["model"]); m.eval()
     W = ck["cfg"]["data"]["window"]
-    rows = [eval_episode(p, m, ck["norm"], ck["in_ch"], W, dev) for p, _ in ck["split"]["test"]]
+    iwp = ck["cfg"]["model"].get("imu_wz_prior", False)
+    if iwp: print("  [imu_wz_prior] 残差先验 wz = imu_yawrate")
+    rows = [eval_episode(p, m, ck["norm"], ck["in_ch"], W, dev, iwp) for p, _ in ck["split"]["test"]]
     agg = lambda k: np.mean([r[k] for r in rows], 0)
     print("=== 仿真测集(%d ep)===" % len(rows))
     print(f"  twist RMSE   LS  vx/vy/wz = {agg('rmse_ls')}")
