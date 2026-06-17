@@ -1,0 +1,13 @@
+# learned_wheel_twist 默认配置
+data:
+  sim_root: ~/Documents/Datasets/w2_sim
+  cache_root: ~/Documents/Datasets/w2_sim_cache
+  window: 25          # 帧 @50Hz = 0.5s
+  wheel_hz: 50
+split: {train: 0.8, val: 0.1, test: 0.1, seed: 0}
+kappa_aug:
+  steer_bias_max_deg: 1.0   # 每轮额外 δ ~ U(±max)
+  speed_scale_std: 0.015    # 每轮额外 s ~ N(1, std)
+model: {tcn_channels: 48, tcn_layers: 4, kernel: 3, dropout: 0.1}
+train: {batch: 256, lr: 1.0e-3, epochs: 60, mse_warmup_epochs: 15, device: cuda}
+geom: {wheelbase: 0.435, track: 0.400, wheel_radius: 0.075}
