@@ -15,7 +15,8 @@ def test_residual_on_ls():
     assert torch.allclose(twist, ls, atol=1e-5)
 
 def test_imu_variant_in_ch():
-    m = TwistTCN(in_ch=14, channels=48, layers=4, kernel=3)
-    x = torch.randn(2, 14, 25); ls = torch.randn(2, 3)
+    # phase-2: 9-ch = 8 wheel + 1 imu_yawrate
+    m = TwistTCN(in_ch=9, channels=48, layers=4, kernel=3)
+    x = torch.randn(2, 9, 25); ls = torch.randn(2, 3)
     twist, logvar = m(x, ls)
     assert twist.shape == (2, 3)

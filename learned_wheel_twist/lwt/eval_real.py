@@ -19,10 +19,12 @@ def main():
     ls = ls_twist(d["steer"][W-1:], d["speed"][W-1:])
     # TwistDataset.make_windows requires gt_vx/vy/wz (sim-only); real bags have none.
     # Build inference windows directly from features without needing ground truth.
-    with_imu = (ck["in_ch"] == 14)
+    with_imu = (ck["in_ch"] == 9)
     feat = [d["steer"], d["speed"]]
-    if with_imu and "imu_g" in d:
-        feat += [d["imu_g"], d["imu_a"]]
+    if with_imu:
+        if "imu_yawrate" not in d:
+            raise KeyError(f"{a.npz} 缺 imu_yawrate(需 phase-2 extract.py 重新抽取)")
+        feat += [d["imu_yawrate"]]   # phase-2 单通道重力投影 yaw-rate
     F = np.concatenate(feat, axis=1).astype(np.float32)  # (N, C)
     norm = ck["norm"]
     preds = []

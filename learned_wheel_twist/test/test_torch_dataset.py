@@ -6,7 +6,8 @@ def _mk(td, name, n=80, kappa=0.005):
     rng = np.random.default_rng(abs(hash(name)) % 2**31)
     np.savez(os.path.join(td, name), t_wheel=np.arange(n)*0.02,
              steer=rng.normal(0, 0.1, (n, 4)), speed=rng.uniform(0.2, 1.0, (n, 4)),
-             gt_vx=rng.normal(0.5, 0.1, n), gt_vy=np.zeros(n), gt_wz=rng.normal(0, 0.1, n), kappa_theory=kappa)
+             gt_vx=rng.normal(0.5, 0.1, n), gt_vy=np.zeros(n), gt_wz=rng.normal(0, 0.1, n),
+             imu_yawrate=rng.normal(0, 0.1, (n, 1)), kappa_theory=kappa)
 
 def test_dataset_item_shapes():
     with tempfile.TemporaryDirectory() as td:
@@ -17,6 +18,16 @@ def test_dataset_item_shapes():
         assert x.shape == (8, 25)
         assert y.shape == (3,) and ls.shape == (3,)
         assert isinstance(x, torch.Tensor)
+
+def test_dataset_with_imu_9ch():
+    # phase-2: with_imu → 9 通道(8 wheel + 1 imu_yawrate),增广只动前 8 维。
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=True, with_imu=True)
+        x, y, ls = ds[0]
+        assert x.shape == (9, 25)
+        assert y.shape == (3,) and ls.shape == (3,)
+
 
 def test_dataset_no_aug_deterministic():
     with tempfile.TemporaryDirectory() as td:

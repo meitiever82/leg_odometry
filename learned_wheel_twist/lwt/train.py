@@ -31,7 +31,7 @@ def main():
     tr, va, te = stratified_split(eps, (cfg["split"]["train"], cfg["split"]["val"], cfg["split"]["test"]), cfg["split"]["seed"])
     print(f"episodes train/val/test = {len(tr)}/{len(va)}/{len(te)}")
     W = cfg["data"]["window"]; ka = cfg["kappa_aug"]
-    in_ch = 14 if a.with_imu else 8
+    in_ch = 9 if a.with_imu else 8   # phase-2: 8 wheel + 1 imu_yawrate
     dtr = TwistDataset([p for p, _ in tr], W, augment=True, with_imu=a.with_imu,
                        steer_bias_max_deg=ka["steer_bias_max_deg"], speed_scale_std=ka["speed_scale_std"])
     norm = dtr.fit_norm()

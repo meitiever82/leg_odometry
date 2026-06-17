@@ -11,7 +11,7 @@ from lwt.kinematics import ls_twist, integrate_twist, ape_percent, rpe_segment
 
 def eval_episode(npz, m, norm, in_ch, W, dev):
     d = np.load(npz); t = d["t_wheel"]
-    ds = TwistDataset([npz], W, augment=False, with_imu=(in_ch == 14), norm=norm)
+    ds = TwistDataset([npz], W, augment=False, with_imu=(in_ch == 9), norm=norm)
     tw_gt = np.stack([d["gt_vx"], d["gt_vy"], d["gt_wz"]], 1)[W-1:]
     tt = t[W-1:]
     ls = ls_twist(d["steer"][W-1:], d["speed"][W-1:])

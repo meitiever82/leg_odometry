@@ -4,13 +4,17 @@ import torch
 from lwt.kinematics import ls_twist
 
 def make_windows(npz_path, window=25, with_imu=False):
-    """一个 episode .npz → (X, Y)。X (M,window,C):C=8(steer4+speed4)或14(+imu_g3+imu_a3);
-    Y (M,3)=窗末真值 twist。M = N-window+1。"""
+    """一个 episode .npz → (X, Y)。X (M,window,C):C=8(steer4+speed4)或 9(+imu_yawrate1);
+    Y (M,3)=窗末真值 twist。M = N-window+1。
+    phase-2:IMU 通道为单标量 imu_yawrate(重力投影 base yaw-rate,+CCW,rad/s),取代
+    旧的 6 维 imu_g/imu_a 拼接(那条路径已废弃)。"""
     d = np.load(npz_path)
     steer, speed = d["steer"], d["speed"]
     feat = [steer, speed]
-    if with_imu and "imu_g" in d:
-        feat += [d["imu_g"], d["imu_a"]]
+    if with_imu:
+        if "imu_yawrate" not in d:
+            raise KeyError(f"{npz_path} 缺 imu_yawrate(需用 phase-2 extract.py 重新抽取)")
+        feat += [d["imu_yawrate"]]
     F = np.concatenate(feat, axis=1)
     N = len(F); M = N - window + 1
     if M <= 0:
