@@ -7,7 +7,8 @@ DUR=${2:-240}
 ENV=${3:-warehouse}          # 生产默认 warehouse;冒烟可传 ground(平地,免云资产下载)
 SEED=$((1000 + EP))
 PKG="$(cd "$(dirname "$0")/.." && pwd)"
-OUT=$HOME/Documents/Datasets/w2_sim/$(printf 'episode_%04d' "$EP")
+# 数据集按场景组织:w2_sim/<场景>/episode_NNNN/
+OUT=$HOME/Documents/Datasets/w2_sim/$ENV/$(printf 'episode_%04d' "$EP")
 mkdir -p "$OUT"
 # ros2 bag record 拒绝写已存在目录(实测 "Output folder ... already exists" 直接退出,
 # 旧 bag 原封不动 → 重采集静默失败,采到的还是上一版数据)。重采前先删旧 rosbag2。

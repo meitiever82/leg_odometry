@@ -37,7 +37,7 @@ while [ "$good" -lt "$TARGET" ]; do
   # 该场景已被标记失败 → 跳过
   [ "${BAD[$scene]:-0}" = "1" ] && continue
 
-  OUT=$DATA/$(printf 'episode_%04d' "$EP")
+  OUT=$DATA/$scene/$(printf 'episode_%04d' "$EP")   # 按场景组织(与 collect_episode.sh 一致)
   rm -rf "$OUT"
   # 首次该场景给超长超时预热(让 MDL 编译完+缓存),已预热用正常超时
   if [ "${WARMED[$scene]:-0}" = "1" ]; then to=$NORMAL_TO; else to=$WARMUP_TO; fi
