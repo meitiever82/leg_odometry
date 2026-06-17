@@ -54,7 +54,8 @@ sleep 2   # 给 sidecar 时间 bind+listen,避免 Isaac 首帧连不上
 SIM_PID=$!
 
 echo "等待仿真话题上线..."
-timeout 300 bash -c \
+# 1800s:重场景(full_warehouse/hospital)首次加载要编译大量 MDL 材质,300s 不够
+timeout 1800 bash -c \
   'until ros2 topic info /sim/joint_states 2>/dev/null | grep -q "Publisher count: [1-9]"; do sleep 2; done'
 
 ros2 bag record -o "$OUT/rosbag2" \
