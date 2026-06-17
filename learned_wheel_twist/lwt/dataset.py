@@ -1,5 +1,7 @@
 # lwt/dataset.py —— .npz → 滑窗样本、按episode分层划分、κ增广、torch Dataset。
 import numpy as np
+import torch
+from lwt.kinematics import ls_twist
 
 def make_windows(npz_path, window=25, with_imu=False):
     """一个 episode .npz → (X, Y)。X (M,window,C):C=8(steer4+speed4)或14(+imu_g3+imu_a3);
@@ -38,3 +40,36 @@ def augment_kappa(window, steer_bias_max_deg=1.0, speed_scale_std=0.015, rng=Non
     window[:, :4] = window[:, :4] + dlt[None, :]
     window[:, 4:8] = window[:, 4:8] * scl[None, :]
     return window
+
+
+class TwistDataset(torch.utils.data.Dataset):
+    """整合:多 episode 滑窗 + 可选 κ增广 + LS先验 + (C,T) 排布。返回 (x[C,T], y[3], ls_prior[3])。
+    增广在 __getitem__ 内对原始窗逐样本随机施加(每次不同),真值 y 不变。"""
+    def __init__(self, npz_paths, window=25, augment=False, with_imu=False,
+                 steer_bias_max_deg=1.0, speed_scale_std=0.015, norm=None, seed=0):
+        self.window, self.augment, self.with_imu = window, augment, with_imu
+        self.sbm, self.sss = steer_bias_max_deg, speed_scale_std
+        self.X, self.Y = [], []
+        for p in npz_paths:
+            X, Y = make_windows(p, window, with_imu)
+            if len(X): self.X.append(X); self.Y.append(Y)
+        self.X = np.concatenate(self.X, 0); self.Y = np.concatenate(self.Y, 0)
+        self.norm = norm
+        self.rng = np.random.default_rng(seed)
+
+    def fit_norm(self):
+        """用本集(不增广)统计 per-channel mean/std,供 train/val/test 共用。"""
+        flat = self.X.reshape(-1, self.X.shape[-1])
+        self.norm = (flat.mean(0), flat.std(0) + 1e-6); return self.norm
+
+    def __len__(self): return len(self.X)
+
+    def __getitem__(self, i):
+        w = self.X[i].copy()
+        if self.augment:
+            w = augment_kappa(w, self.sbm, self.sss, self.rng)
+        ls = np.array(ls_twist(w[-1, :4], w[-1, 4:8]))
+        if self.norm is not None:
+            w = (w - self.norm[0]) / self.norm[1]
+        x = torch.from_numpy(w.T.copy()).float()
+        return x, torch.from_numpy(self.Y[i]).float(), torch.from_numpy(ls).float()
