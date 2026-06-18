@@ -43,3 +43,25 @@ realism:
   accel_noise:             # 加速度小白噪声(避免 accel 不真实地干净)
     enable: true
     sigma: 0.05
+# 阶段六:真机激光监督 fine-tune(留一法)。
+# Step A —— sim 预训练时仅对**轮速通道**(0-7:steer4+speed4)注入小高斯输入噪声(IMU 通道不动,
+# 因阶段五-b 已证「给陀螺加噪 → wz 偏置回潮」)。让模型对轮速标定/读数扰动鲁棒,而保留陀螺为可信 wz 源。
+# 与 realism/κ-aug 正交:--wheel-noise 时启用,默认幅值取真机量级(speed ~1.5% 典型速、steer ~0.3°)。
+pretrain:
+  wheel_noise_std:
+    enable: true
+    speed_std: 0.01        # m/s:per-sample 白噪声叠加到 4 路轮速(典型速 ~0.5-1 m/s → ~1-2%)
+    steer_std_deg: 0.3     # deg:per-sample 白噪声叠加到 4 路转向角(读数抖动量级)
+# Step C —— 真机激光监督 fine-tune(LOO)。低 LR、少 epoch、轨迹损失对齐激光 TUM;
+# L2-to-pretrained 锚正则防只 2 个训练 bag 过拟合。
+finetune:
+  lr: 1.0e-4               # 低 LR(gentle,防把预训练结构推翻)
+  epochs: 10              # 少 epoch(gentle,disp_weight 强锚下 8-10 即收敛)
+  segment_sec: 10.0        # ~10s 段(窗末采样)做长程 RPE
+  stride_sec: 5.0          # 段重叠步长
+  seg_batch: 4             # 每步并行段数(真机段 S 大,显存敏感)
+  sub_strides: [50, 150, 350]  # RPE 子段跨度(帧 @50Hz):短程一致 + 长程暴露 wz 偏置
+  yaw_weight: 3.0          # Δyaw 相对 Δxy 权重
+  disp_weight: 6.0         # 绝对位移尺度锚权重(防 vx 塌缩退化解,见 lidar_loss._disp_scale_anchor)
+  l2_anchor: 1.0e-3        # L2-to-pretrained-weights 锚(防 2-bag 过拟合)
+  grad_clip: 5.0

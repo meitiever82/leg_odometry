@@ -58,6 +58,20 @@ def apply_gyro_realism(window, enable=True, sigma_bias=0.003, sigma_noise=0.005,
     return window
 
 
+def apply_wheel_noise(window, enable=True, speed_std=0.01, steer_std_deg=0.3, rng=None):
+    """阶段六 Step A —— 仅对**轮速通道**(steer[0:4] rad + speed[4:8] m/s)加 per-sample 高斯白噪声。
+    **不动 IMU 通道**(阶段五-b 已证「给陀螺加噪 → wz 偏置回潮」,故陀螺保持可信 wz 源)。
+    动机:让 sim 预训练对真机轮速读数抖动/小标定扰动鲁棒,同时不破坏 wz 真值源。
+    幅值:speed_std m/s(典型速 ~0.5-1 → ~1-2%)、steer_std_deg 度(读数抖动)。标签不变。enable=False no-op。"""
+    if not enable:
+        return window
+    rng = rng or np.random.default_rng()
+    W = window.shape[0]
+    window[:, 0:4] += rng.normal(0.0, np.radians(steer_std_deg), (W, 4)).astype(window.dtype)
+    window[:, 4:8] += rng.normal(0.0, speed_std, (W, 4)).astype(window.dtype)
+    return window
+
+
 def apply_accel_noise(window, enable=True, sigma=0.05, rng=None):
     """imu_a_base 三轴小白噪声,使 accel 不至于不真实地干净。标签不变。"""
     if not enable:

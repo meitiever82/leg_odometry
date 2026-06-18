@@ -65,6 +65,7 @@ def train_traj(cfg, a):
     cfg["model"]["wz_anchor"] = False
     cfg["model"]["imu_wz_prior"] = False
     cfg["model"]["traj_loss"] = True
+    cfg["model"]["wheel_noise"] = bool(getattr(a, "wheel_noise", False))
     tj = cfg["traj"]
     print(f"[approach-2 step1 traj-loss] data-driven 14ch,prior='none'。"
           f"segment_sec={tj['segment_sec']} stride_sec={tj['stride_sec']} "
@@ -83,17 +84,25 @@ def train_traj(cfg, a):
         print(f"[approach-2 step2a realism] κ-bulk(std={rb['kappa_bulk']['kappa_std']}) "
               f"gyro(σb={rb['gyro']['sigma_bias']},σn={rb['gyro']['sigma_noise']}) "
               f"bumps(rate={rb['bumps']['event_rate']}) accel(σ={rb['accel_noise']['sigma']})")
+    # 阶段六 Step A:仅轮速通道高斯输入噪声(IMU 不动)。--wheel-noise 时启用,与 realism 正交。
+    wheel_noise = cfg.get("pretrain", {}).get("wheel_noise_std") if getattr(a, "wheel_noise", False) else None
+    if wheel_noise and wheel_noise.get("enable"):
+        print(f"[阶段六 Step A wheel-noise] 仅轮速通道:speed_std={wheel_noise['speed_std']} m/s, "
+              f"steer_std={wheel_noise['steer_std_deg']}° (IMU 通道不加噪)")
+    else:
+        wheel_noise = None
     # 逐帧训练集:用于 fit_norm + 逐帧 NLL 正则 + per-frame std 权重。复用既有 data_driven 路径。
     # 注意:norm 在 fit_norm() 里用 **未增广** 的 self.X 统计(增广在 __getitem__),故 norm 仍是干净 sim 分布。
     dtr_pf = TwistDataset([p for p, _ in tr], W, augment=True, with_imu=False,
                           steer_bias_max_deg=ka["steer_bias_max_deg"], speed_scale_std=ka["speed_scale_std"],
-                          data_driven=True, realism=realism)
+                          data_driven=True, realism=realism, wheel_noise=wheel_noise)
     norm = dtr_pf.fit_norm()
     ystd = dtr_pf.Y.std(0) + 1e-6; w = torch.tensor(1.0/ystd, dtype=torch.float32, device=dev)
     Lpf = torch.utils.data.DataLoader(dtr_pf, batch_size=cfg["train"]["batch"], shuffle=True, num_workers=4)
     # 分段训练集(轨迹损失)。norm 复用逐帧统计。
     seg_tr = SegmentDataset([p for p, _ in tr], W, tj["segment_sec"], hz, norm=norm,
-                            data_driven=True, stride_sec=tj["stride_sec"], realism=realism)
+                            data_driven=True, stride_sec=tj["stride_sec"], realism=realism,
+                            wheel_noise=wheel_noise)
     # 验证段保持干净 sim(不增广)——val 是 in-distribution sim 门槛的口径基准。
     seg_va = SegmentDataset([p for p, _ in va], W, tj["segment_sec"], hz, norm=norm,
                             data_driven=True, stride_sec=tj["segment_sec"])
@@ -199,6 +208,9 @@ def main():
     ap.add_argument("--realism", action="store_true",
                     help="approach-2 step2a: sim 保真增广(κ-bulk + 真实陀螺噪声/残差偏置 + 合成颠簸 + 加速度噪声),"
                          "把真机域退化注入 SIM 训练输入闭合 sim→real gap(仅配 --traj-loss;标签不变)。")
+    ap.add_argument("--wheel-noise", action="store_true",
+                    help="阶段六 Step A: sim 预训练时仅对**轮速通道**(steer+speed)注入小高斯输入噪声(IMU 不动),"
+                         "为真机激光 fine-tune 准备鲁棒的轮速→twist 结构(配 --traj-loss)。")
     ap.add_argument("--epochs", type=int, default=cfg["train"]["epochs"])
     ap.add_argument("--out", default="learned_wheel_twist/runs/lwt_wheel")
     a = ap.parse_args()

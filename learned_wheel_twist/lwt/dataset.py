@@ -113,8 +113,11 @@ class SegmentDataset(torch.utils.data.Dataset):
       yr_seg (S,)            窗末 imu_yawrate
     norm 复用 per-frame 训练集统计(同模型同输入分布)。data_driven 模式 14ch。"""
     def __init__(self, npz_paths, window=25, segment_sec=10.0, wheel_hz=50,
-                 norm=None, data_driven=True, stride_sec=None, realism=None, seed=0):
+                 norm=None, data_driven=True, stride_sec=None, realism=None, seed=0,
+                 wheel_noise=None):
         self.window, self.norm = window, norm
+        # 阶段六 Step A:仅轮速通道高斯噪声(IMU 不动)。与 realism 正交,可单独启用。
+        self.wheel_noise = (wheel_noise if (wheel_noise and wheel_noise.get("enable")) else None)
         # approach-2 step2a: sim 保真增广(仅 data_driven 14ch)。per-segment 抽一组常值
         # κ-bias / 陀螺残差偏置(模拟该 episode 固定标定/对齐状态),保证轨迹损失看到一致偏置;
         # 白噪声/bumps 仍逐输出帧窗随机施加。realism=None 或 enable=False 则不增广。
@@ -160,6 +163,12 @@ class SegmentDataset(torch.utils.data.Dataset):
         X = s["X"].copy()                              # (S,window,C)
         if self.realism is not None:
             X = self._augment_segment(X)
+        if self.wheel_noise is not None:
+            from lwt.realism import apply_wheel_noise
+            wn = self.wheel_noise
+            for j in range(X.shape[0]):
+                apply_wheel_noise(X[j], enable=True, speed_std=wn.get("speed_std", 0.01),
+                                  steer_std_deg=wn.get("steer_std_deg", 0.3), rng=self.rng)
         if self.norm is not None:
             X = (X - self.norm[0]) / self.norm[1]
         x = torch.from_numpy(np.transpose(X, (0, 2, 1)).copy()).float()  # (S,C,window)
@@ -172,8 +181,11 @@ class TwistDataset(torch.utils.data.Dataset):
     增广在 __getitem__ 内对原始窗逐样本随机施加(每次不同),真值 y 不变。"""
     def __init__(self, npz_paths, window=25, augment=False, with_imu=False,
                  steer_bias_max_deg=1.0, speed_scale_std=0.015, norm=None, seed=0,
-                 imu_wz_prior=False, data_driven=False, wz_anchor=False, realism=None):
+                 imu_wz_prior=False, data_driven=False, wz_anchor=False, realism=None,
+                 wheel_noise=None):
         self.window, self.augment, self.with_imu = window, augment, with_imu
+        # 阶段六 Step A:仅轮速通道高斯噪声(IMU 不动),与 realism/κ-aug 正交。
+        self.wheel_noise = (wheel_noise if (wheel_noise and wheel_noise.get("enable")) else None)
         # approach-2 step2a: 仅 data_driven 14ch 启用 sim 保真增广(取代 κ-aug,因 κ-bulk 已含轮速尺度)。
         self._realism = RealismAug(realism, np.random.default_rng(seed + 7)) \
             if (realism and realism.get("enable") and data_driven) else None
@@ -209,6 +221,11 @@ class TwistDataset(torch.utils.data.Dataset):
             w = self._realism(w)
         elif self.augment:
             w = augment_kappa(w, self.sbm, self.sss, self.rng)
+        if self.wheel_noise is not None:
+            from lwt.realism import apply_wheel_noise
+            wn = self.wheel_noise
+            apply_wheel_noise(w, enable=True, speed_std=wn.get("speed_std", 0.01),
+                              steer_std_deg=wn.get("steer_std_deg", 0.3), rng=self.rng)
         if self.wz_anchor:
             # phase-4 wz_anchor:先验 = [0, 0, imu_yawrate(窗末,未标准化)]。
             # vx/vy 先验 0(从 raw 学),wz 锚定去偏陀螺;模型走 ls_prior+残差。

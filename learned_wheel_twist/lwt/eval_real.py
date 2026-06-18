@@ -53,22 +53,36 @@ def main():
             preds.append(twp[0].cpu().numpy())
     pred = np.array(preds); gyro_end = np.array(gyro_end)
     T = np.loadtxt(a.tum); ref = np.column_stack([T[:, 0], T[:, 1], T[:, 2]])
+    # hybrid 目标线:vx/vy = 模型学习头,wz = 去偏陀螺(imu_yawrate)。阶段四/五/五-b 一致裁定的上界。
+    hybrid = pred.copy(); hybrid[:, 2] = gyro_end
     def metr(tw):
         tr = integrate_twist(t, tw)
         return (rpe_segment(tr, ref, 10.0), rpe_segment(tr, ref, 50.0),
                 ape_se2_percent(tr, ref))
     plen = _path_len(ref[:, 1:3])
-    mls, mpr = metr(ls), metr(pred)
+    mls, mpr, mhy = metr(ls), metr(pred), metr(hybrid)
     print(f"=== sim-to-real {Path(a.npz).name} (激光路径 {plen:.0f}m) ===")
-    print(f"  RPE@10m / @50m / SE2-APE  LS   = {mls[0]:.2f}% / {mls[1]:.2f}% / {mls[2]:.2f}%")
-    print(f"  RPE@10m / @50m / SE2-APE  模型 = {mpr[0]:.2f}% / {mpr[1]:.2f}% / {mpr[2]:.2f}%")
+    print(f"  RPE@10m / @50m / SE2-APE  LS     = {mls[0]:.2f}% / {mls[1]:.2f}% / {mls[2]:.2f}%")
+    print(f"  RPE@10m / @50m / SE2-APE  hybrid = {mhy[0]:.2f}% / {mhy[1]:.2f}% / {mhy[2]:.2f}%")
+    print(f"  RPE@10m / @50m / SE2-APE  模型   = {mpr[0]:.2f}% / {mpr[1]:.2f}% / {mpr[2]:.2f}%")
     print("  sim-to-real 门槛(模型 RPE@10m < LS):", "PASS" if mpr[0] < mls[0] else "FAIL")
+    print(f"  RESULT_JSON {{\"bag\":\"{Path(a.npz).name}\",\"plen\":{plen:.1f},"
+          f"\"ls\":[{mls[0]:.3f},{mls[1]:.3f},{mls[2]:.3f}],"
+          f"\"hybrid\":[{mhy[0]:.3f},{mhy[1]:.3f},{mhy[2]:.3f}],"
+          f"\"model\":[{mpr[0]:.3f},{mpr[1]:.3f},{mpr[2]:.3f}]}}")
+    # 系统误差修正检查:wheel-scale = 模型积分路径长 / 激光路径长(理想 1.0;真机轮速 6-9% 偏)。
+    tr_m = integrate_twist(t, pred)
+    model_plen = _path_len(tr_m[:, 1:3])
+    print(f"  [wheel-scale] 模型积分路径长/激光 = {model_plen/max(plen,1e-9):.4f} "
+          f"(模型={model_plen:.1f}m 激光={plen:.1f}m)")
     # 机理检查:wz_model 相对 imu_yawrate(去偏陀螺)的有符号 DC 偏差 + 积分 Δyaw[deg]。
     # wz-anchor 期望 ≈0(陀螺锚定杀死直流偏置);phase-3 data-driven 曾 -42/-51/-86°。
     dwz = pred[:, 2] - gyro_end
     dt = np.diff(t); dyaw_int = float(np.sum(dwz[:-1] * dt))   # 中点近似积分残差 wz·dt
     print(f"  [机理] mean(wz_model - imu_yawrate) = {float(dwz.mean()):+.5f} rad/s, "
           f"积分 Δyaw = {np.degrees(dyaw_int):+.1f}°")
+    print(f"  RESULT_BIAS {{\"wz_bias\":{float(dwz.mean()):.6f},\"dyaw_deg\":{np.degrees(dyaw_int):.1f},"
+          f"\"wheel_scale\":{model_plen/max(plen,1e-9):.4f}}}")
     # 航向漂移 vs 激光:模型积分末端 yaw - 激光参考末端 yaw(由参考 xy 切线估计)。
     tr_pred = integrate_twist(t, pred)
     yaw_pred_end = float(tr_pred[-1, 3])
