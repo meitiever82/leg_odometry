@@ -67,6 +67,71 @@ def augment_kappa(window, steer_bias_max_deg=1.0, speed_scale_std=0.015, rng=Non
     return window
 
 
+def make_segments(npz_path, window=25, segment_sec=10.0, wheel_hz=50,
+                  data_driven=True, stride_sec=None):
+    """一个 episode .npz → 连续 L 秒分段列表,供 approach-2 轨迹损失。
+
+    每段含 S=round(segment_sec*wheel_hz) 个"输出帧",每个输出帧消费它自己的 W 窗
+    (重叠)。第一个输出帧的窗末位于全局索引 window-1,故段需要 (window-1)+S 个原始帧。
+
+    返回 segs: list,每元素 dict:
+      Xseg (S, window, C)  每输出帧的输入窗(C 见 build_features)
+      tseg (S,)            该段输出帧时间戳(原点未平移,积分器自处理)
+      Gseg (S, 3)          该段输出帧 GT twist (vx,vy,wz)
+      YRseg (S,)           窗末 imu_yawrate(机理检查/可选先验)
+    分段步长 stride_sec 默认 = segment_sec(不重叠);设小可增样本数。"""
+    d = np.load(npz_path)
+    F = build_features(d, with_imu=False, data_driven=data_driven, wz_anchor=False).astype(np.float32)
+    t = np.asarray(d["t_wheel"], float)
+    gt = np.stack([d["gt_vx"], d["gt_vy"], d["gt_wz"]], 1).astype(np.float32)
+    keys = d.files if hasattr(d, "files") else d
+    yawrate = (np.asarray(d["imu_yawrate"]).reshape(-1).astype(np.float32)
+               if "imu_yawrate" in keys else np.zeros(len(F), np.float32))
+    N = len(F)
+    S = int(round(segment_sec * wheel_hz))
+    if N < (window - 1) + S:
+        return []
+    stride = int(round((stride_sec if stride_sec else segment_sec) * wheel_hz))
+    stride = max(1, stride)
+    segs = []
+    # out0 = 第一个输出帧在原始序列中的窗末索引,从 window-1 开始,步进 stride。
+    last_out0 = N - S
+    for out0 in range(window - 1, last_out0 + 1, stride):
+        idx = np.arange(out0, out0 + S)               # 各输出帧窗末全局索引 (S,)
+        Xseg = np.stack([F[j - window + 1: j + 1] for j in idx], 0)  # (S,window,C)
+        segs.append(dict(X=Xseg.astype(np.float32), t=t[idx].astype(np.float64),
+                         G=gt[idx], YR=yawrate[idx]))
+    return segs
+
+
+class SegmentDataset(torch.utils.data.Dataset):
+    """连续 L 秒分段数据集(approach-2 轨迹损失)。每项返回一段:
+      x_seg  (S, C, window)  逐输出帧输入窗(已标准化,C×T 排布,模型可直接 roll)
+      t_seg  (S,)            时间戳(float64)
+      g_seg  (S, 3)          GT twist
+      yr_seg (S,)            窗末 imu_yawrate
+    norm 复用 per-frame 训练集统计(同模型同输入分布)。data_driven 模式 14ch。"""
+    def __init__(self, npz_paths, window=25, segment_sec=10.0, wheel_hz=50,
+                 norm=None, data_driven=True, stride_sec=None):
+        self.window, self.norm = window, norm
+        self.segs = []
+        for p in npz_paths:
+            self.segs += make_segments(p, window, segment_sec, wheel_hz,
+                                       data_driven=data_driven, stride_sec=stride_sec)
+
+    def __len__(self):
+        return len(self.segs)
+
+    def __getitem__(self, i):
+        s = self.segs[i]
+        X = s["X"].copy()                              # (S,window,C)
+        if self.norm is not None:
+            X = (X - self.norm[0]) / self.norm[1]
+        x = torch.from_numpy(np.transpose(X, (0, 2, 1)).copy()).float()  # (S,C,window)
+        return (x, torch.from_numpy(s["t"]).double(),
+                torch.from_numpy(s["G"]).float(), torch.from_numpy(s["YR"]).float())
+
+
 class TwistDataset(torch.utils.data.Dataset):
     """整合:多 episode 滑窗 + 可选 κ增广 + LS先验 + (C,T) 排布。返回 (x[C,T], y[3], ls_prior[3])。
     增广在 __getitem__ 内对原始窗逐样本随机施加(每次不同),真值 y 不变。"""

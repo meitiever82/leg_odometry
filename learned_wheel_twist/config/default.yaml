@@ -11,3 +11,13 @@ kappa_aug:
 model: {tcn_channels: 48, tcn_layers: 4, kernel: 3, dropout: 0.1}
 train: {batch: 256, lr: 1.0e-3, epochs: 60, mse_warmup_epochs: 15, device: cuda, bias_penalty: 1.0}
 geom: {wheelbase: 0.435, track: 0.400, wheel_radius: 0.075}
+# approach-2 step1 端到端可微长程轨迹损失(--traj-loss 时生效)。
+traj:
+  segment_sec: 10.0        # 每段时长(~500 帧 @50Hz)→ 让 ~10s 的积分航向漂移进入损失
+  stride_sec: 5.0          # 分段步长(<segment_sec 则重叠采样,增样本)
+  seg_batch: 8             # 每步并行段数(显存敏感:S×B×W 的 rollout)
+  sub_strides: [50, 150, 350]  # RPE 子段跨度(帧):短程局部一致 + 长程累积航向漂移
+  yaw_weight: 3.0          # 轨迹损失中 Δyaw 相对 Δxy 的权重
+  lambda_pf: 2.0           # 逐帧 twist MSE 正则强度(锚 vx/vy/wz 尺度,防退化/不稳)
+  pf_warmup_epochs: 12     # 前 N 轮仅逐帧 MSE 预热,之后启用轨迹损失
+  traj_lr_scale: 0.3       # 轨迹损失阶段学习率缩放(rollout 梯度噪声大,降 LR 稳)
