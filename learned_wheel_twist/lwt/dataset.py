@@ -3,19 +3,32 @@ import numpy as np
 import torch
 from lwt.kinematics import ls_twist
 
-def make_windows(npz_path, window=25, with_imu=False):
-    """一个 episode .npz → (X, Y)。X (M,window,C):C=8(steer4+speed4)或 9(+imu_yawrate1);
-    Y (M,3)=窗末真值 twist。M = N-window+1。
-    phase-2:IMU 通道为单标量 imu_yawrate(重力投影 base yaw-rate,+CCW,rad/s),取代
-    旧的 6 维 imu_g/imu_a 拼接(那条路径已废弃)。"""
-    d = np.load(npz_path)
+def build_features(d, with_imu=False, data_driven=False):
+    """从 .npz 字典构造逐帧特征矩阵 F (N,C),三种通道布局:
+    - 默认(phase-1):C=8  = steer4 + speed4。
+    - with_imu(phase-2):C=9  = steer4 + speed4 + imu_yawrate1(重力投影 base yaw-rate)。
+    - data_driven(phase-3):C=14 = steer4 + speed4 + imu_g_base3 + imu_a_base3。
+      纯 raw 轮速 + 完整 base-frame IMU,**无任何 LS 特征**,网络从数据学运动学。
+    data_driven 与 with_imu 互斥(data_driven 优先)。"""
     steer, speed = d["steer"], d["speed"]
     feat = [steer, speed]
-    if with_imu:
-        if "imu_yawrate" not in d:
-            raise KeyError(f"{npz_path} 缺 imu_yawrate(需用 phase-2 extract.py 重新抽取)")
+    if data_driven:
+        for k in ("imu_g_base", "imu_a_base"):
+            if k not in (d.files if hasattr(d, "files") else d):
+                raise KeyError(f"缺 {k}(需用 phase-3 extract.py 重新抽取 imu_g_base/imu_a_base)")
+        feat += [d["imu_g_base"], d["imu_a_base"]]
+    elif with_imu:
+        if "imu_yawrate" not in (d.files if hasattr(d, "files") else d):
+            raise KeyError("缺 imu_yawrate(需用 phase-2 extract.py 重新抽取)")
         feat += [d["imu_yawrate"]]
-    F = np.concatenate(feat, axis=1)
+    return np.concatenate(feat, axis=1)
+
+
+def make_windows(npz_path, window=25, with_imu=False, data_driven=False):
+    """一个 episode .npz → (X, Y)。X (M,window,C),C 见 build_features;
+    Y (M,3)=窗末真值 twist。M = N-window+1。"""
+    d = np.load(npz_path)
+    F = build_features(d, with_imu, data_driven)
     N = len(F); M = N - window + 1
     if M <= 0:
         return np.zeros((0, window, F.shape[1])), np.zeros((0, 3))
@@ -51,15 +64,17 @@ class TwistDataset(torch.utils.data.Dataset):
     增广在 __getitem__ 内对原始窗逐样本随机施加(每次不同),真值 y 不变。"""
     def __init__(self, npz_paths, window=25, augment=False, with_imu=False,
                  steer_bias_max_deg=1.0, speed_scale_std=0.015, norm=None, seed=0,
-                 imu_wz_prior=False):
+                 imu_wz_prior=False, data_driven=False):
         self.window, self.augment, self.with_imu = window, augment, with_imu
+        # phase-3: data_driven → 14ch raw 轮速+base IMU,无 LS 先验(ls_prior 返回 0)。
+        self.data_driven = data_driven
         # phase-2b: imu_wz_prior → 残差先验的 wz 分量改用窗末 imu_yawrate(无偏陀螺),
         # 取代 κ-偏置的轮速 LS wz;vx/vy 仍用 LS。仅在 with_imu(in_ch=9)时生效。
-        self.imu_wz_prior = imu_wz_prior and with_imu
+        self.imu_wz_prior = imu_wz_prior and with_imu and not data_driven
         self.sbm, self.sss = steer_bias_max_deg, speed_scale_std
         self.X, self.Y = [], []
         for p in npz_paths:
-            X, Y = make_windows(p, window, with_imu)
+            X, Y = make_windows(p, window, with_imu, data_driven)
             if len(X): self.X.append(X); self.Y.append(Y)
         self.X = np.concatenate(self.X, 0); self.Y = np.concatenate(self.Y, 0)
         self.norm = norm
@@ -76,9 +91,14 @@ class TwistDataset(torch.utils.data.Dataset):
         w = self.X[i].copy()
         if self.augment:
             w = augment_kappa(w, self.sbm, self.sss, self.rng)
-        ls = np.array(ls_twist(w[-1, :4], w[-1, 4:8]))
-        if self.imu_wz_prior:
-            ls[2] = w[-1, 8]   # 窗末 imu_yawrate(第 9 通道,未标准化)取代 LS wz
+        if self.data_driven:
+            # 纯 data-driven:无 LS 先验,ls_prior=0(模型 prior='none' 会忽略它)。
+            # κ 增广仍施加于轮速通道作为正则,但不构造 LS 特征/先验。
+            ls = np.zeros(3, dtype=np.float64)
+        else:
+            ls = np.array(ls_twist(w[-1, :4], w[-1, 4:8]))
+            if self.imu_wz_prior:
+                ls[2] = w[-1, 8]   # 窗末 imu_yawrate(第 9 通道,未标准化)取代 LS wz
         if self.norm is not None:
             w = (w - self.norm[0]) / self.norm[1]
         x = torch.from_numpy(w.T.copy()).float()

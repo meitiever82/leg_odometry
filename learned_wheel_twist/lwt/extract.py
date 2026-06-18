@@ -13,7 +13,7 @@ from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import JointState, Imu
 from nav_msgs.msg import Odometry
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lwt.imu_yawrate import project_yawrate, debias_yawrate
+from lwt.imu_yawrate import project_yawrate, debias_yawrate, base_frame_imu
 
 WHEEL_KEYS = ("front_left", "front_right", "rear_left", "rear_right")
 IMU_TOPICS = ("/sim/imu", "/rslidar_imu_data")
@@ -83,6 +83,16 @@ def main():
                   f"(可能高估零偏);bias={bias:+.5f} rad/s")
         d["imu_yawrate"] = yr_db
         d["imu_yawrate_bias"] = np.float64(bias)  # 已扣除的零偏,供溯源
+        # phase-3:完整 base-frame 陀螺/加速度(重力对齐旋转 + 去陀螺零偏),供 data-driven 变体。
+        # R_base_imu、b_g 均由启动静止窗(数据)估出(等价 calibrate_kappa 的安装外参自标定)。
+        # 在 IMU 原始时戳上做(静止窗掩码用插值到 IMU 时戳的轮速),再对齐到 t_wheel,与
+        # imu_g/imu_a 同一时基,保持 back-compat(旧字段不变,仅新增 base 两路)。
+        spd_at_imu = np.stack([np.interp(it, wt, wv[:, k]) for k in range(wv.shape[1])], 1)
+        g_base, a_base, R_bi, b_g, found_bf = base_frame_imu(ia, ig, it, spd_at_imu, a.static_sec, a.speed_eps)
+        d["imu_g_base"] = np.stack([np.interp(wt, it, g_base[:, k]) for k in range(3)], 1)
+        d["imu_a_base"] = np.stack([np.interp(wt, it, a_base[:, k]) for k in range(3)], 1)
+        d["imu_R_base"] = R_bi          # 3×3 安装→base 对齐旋转(溯源)
+        d["imu_gyro_bias"] = b_g        # (3,) 静止窗陀螺零偏(溯源)
     pf = ep/"episode_params.yaml"
     if pf.exists():
         d["kappa_theory"] = float(yaml.safe_load(pf.read_text()).get("kappa_theory", np.nan))

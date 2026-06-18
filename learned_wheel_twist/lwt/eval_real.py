@@ -6,36 +6,38 @@ import argparse, sys, numpy as np, torch
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lwt.model import TwistTCN
-from lwt.kinematics import ls_twist, integrate_twist, rpe_segment, _path_len
+from lwt.dataset import build_features
+from lwt.kinematics import ls_twist, integrate_twist, rpe_segment, _path_len, ape_se2_percent
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("ckpt"); ap.add_argument("npz"); ap.add_argument("tum")
     a = ap.parse_args()
     ck = torch.load(a.ckpt, weights_only=False); dev = "cuda" if torch.cuda.is_available() else "cpu"
+    prior = ck["cfg"]["model"].get("prior", "ls")
     m = TwistTCN(ck["in_ch"], ck["cfg"]["model"]["tcn_channels"], ck["cfg"]["model"]["tcn_layers"],
-                 ck["cfg"]["model"]["kernel"]).to(dev); m.load_state_dict(ck["model"]); m.eval()
+                 ck["cfg"]["model"]["kernel"], prior=prior).to(dev); m.load_state_dict(ck["model"]); m.eval()
     W = ck["cfg"]["data"]["window"]
     d = np.load(a.npz); t = d["t_wheel"][W-1:]
     ls = ls_twist(d["steer"][W-1:], d["speed"][W-1:])
     # TwistDataset.make_windows requires gt_vx/vy/wz (sim-only); real bags have none.
     # Build inference windows directly from features without needing ground truth.
+    dd = ck["cfg"]["model"].get("data_driven", False)         # phase-3
     with_imu = (ck["in_ch"] == 9)
-    feat = [d["steer"], d["speed"]]
-    if with_imu:
-        if "imu_yawrate" not in d:
-            raise KeyError(f"{a.npz} 缺 imu_yawrate(需 phase-2 extract.py 重新抽取)")
-        feat += [d["imu_yawrate"]]   # phase-2 单通道重力投影 yaw-rate
-    F = np.concatenate(feat, axis=1).astype(np.float32)  # (N, C)
+    F = build_features(d, with_imu=with_imu, data_driven=dd).astype(np.float32)  # (N, C)
     norm = ck["norm"]
     iwp = ck["cfg"]["model"].get("imu_wz_prior", False)   # phase-2b
     if iwp: print("  [imu_wz_prior] 残差先验 wz = imu_yawrate")
+    if dd: print("  [data-driven] prior='none' 直接回归(14ch raw 轮速+base IMU,无 LS 先验)")
     preds = []
     with torch.no_grad():
         for i in range(len(F) - W + 1):
             w = F[i:i+W].copy()  # (W, C)
-            lsp = np.array(ls_twist(w[-1, :4], w[-1, 4:8]), dtype=np.float32)
-            if iwp:
-                lsp[2] = w[-1, 8]   # 窗末 imu_yawrate(第 9 通道,未标准化)
+            if dd:
+                lsp = np.zeros(3, dtype=np.float32)   # data-driven:无 LS 先验
+            else:
+                lsp = np.array(ls_twist(w[-1, :4], w[-1, 4:8]), dtype=np.float32)
+                if iwp:
+                    lsp[2] = w[-1, 8]   # 窗末 imu_yawrate(第 9 通道,未标准化)
             if norm is not None:
                 w = (w - norm[0]) / norm[1]
             x = torch.from_numpy(w.T.copy()).float()[None].to(dev)
@@ -46,12 +48,14 @@ def main():
     T = np.loadtxt(a.tum); ref = np.column_stack([T[:, 0], T[:, 1], T[:, 2]])
     def metr(tw):
         tr = integrate_twist(t, tw)
-        return rpe_segment(tr, ref, 10.0), rpe_segment(tr, ref, 50.0)
+        return (rpe_segment(tr, ref, 10.0), rpe_segment(tr, ref, 50.0),
+                ape_se2_percent(tr, ref))
     plen = _path_len(ref[:, 1:3])
+    mls, mpr = metr(ls), metr(pred)
     print(f"=== sim-to-real {Path(a.npz).name} (激光路径 {plen:.0f}m) ===")
-    print(f"  RPE@10m / @50m  LS   = {metr(ls)[0]:.2f}% / {metr(ls)[1]:.2f}%")
-    print(f"  RPE@10m / @50m  模型 = {metr(pred)[0]:.2f}% / {metr(pred)[1]:.2f}%")
-    print("  sim-to-real 门槛(模型 RPE < LS):", "PASS" if metr(pred)[0] < metr(ls)[0] else "FAIL")
+    print(f"  RPE@10m / @50m / SE2-APE  LS   = {mls[0]:.2f}% / {mls[1]:.2f}% / {mls[2]:.2f}%")
+    print(f"  RPE@10m / @50m / SE2-APE  模型 = {mpr[0]:.2f}% / {mpr[1]:.2f}% / {mpr[2]:.2f}%")
+    print("  sim-to-real 门槛(模型 RPE@10m < LS):", "PASS" if mpr[0] < mls[0] else "FAIL")
 
 if __name__ == "__main__":
     main()

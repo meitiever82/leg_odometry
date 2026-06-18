@@ -1,6 +1,6 @@
 import sys, numpy as np
 sys.path.insert(0, "learned_wheel_twist")
-from lwt.kinematics import ls_twist, integrate_twist, ape_percent, rpe_segment
+from lwt.kinematics import ls_twist, integrate_twist, ape_percent, rpe_segment, se2_align, ape_se2_percent
 
 def test_ls_twist_pure_translation():
     ang = np.zeros(4); spd = np.ones(4)
@@ -68,6 +68,24 @@ def test_rpe_identity_zero():
     yaw = np.zeros((len(truth), 1))
     traj = np.column_stack([truth[:, 0], truth[:, 1:3], yaw])  # (N,4)
     assert rpe_segment(traj, truth, 10.0) < 1e-6
+
+def test_se2_align_recovers_rigid_transform():
+    truth = _gentle_arc_truth()
+    ref = truth[:, 1:3]
+    R = _rot(0.7); est = (ref - ref.mean(0)) @ R.T + np.array([3.0, -2.0])  # 已知刚体变换
+    Rot, t, est_a = se2_align(est, ref)
+    np.testing.assert_allclose(est_a, ref, atol=1e-9)            # 完全对齐回 ref
+    np.testing.assert_allclose(np.linalg.det(Rot), 1.0, atol=1e-9)  # 真旋转(无翻转/缩放)
+
+
+def test_ape_se2_zero_after_rigid():
+    truth = _gentle_arc_truth()
+    p0 = truth[0, 1:3]
+    xy = (truth[:, 1:3] - p0) @ _rot(1.2).T + np.array([10.0, -5.0])  # 整体刚体偏移
+    traj = np.column_stack([truth[:, 0], xy, np.zeros(len(truth))])
+    assert ape_se2_percent(traj, truth) < 1e-6                   # SE2 对齐后误差≈0
+    assert ape_percent(traj, truth) > 5.0                        # 首点对齐则残留大
+
 
 def test_rpe_detects_scale_drift():
     truth = _gentle_arc_truth()

@@ -45,6 +45,47 @@ def project_yawrate(accel, gyro, sign=1.0):
     return sign * (gyro @ up)
 
 
+def from_two_vectors(a, b):
+    """绕最小旋转把 unit(a) 转到 unit(b)(等价 Eigen::Quaternion::FromTwoVectors)。
+
+    用于 IMU 安装系→base 系对齐:a=静止窗平均加速度(比力≈重力反方向),b=[0,0,1]。
+    返回 3×3 旋转矩阵 R 使 R@unit(a)=unit(b)。退化(a∥b)时返回 ±I。
+    """
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    v = np.cross(a, b)
+    c = float(np.dot(a, b))
+    if np.linalg.norm(v) < 1e-9:
+        return np.eye(3) if c > 0 else -np.eye(3)
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
+
+
+def base_frame_imu(accel, gyro, t, speed, static_sec=2.0, speed_eps=0.05):
+    """phase-3:把整段 IMU 的陀螺/加速度从安装系旋到 base(重力对齐)系,并去陀螺零偏。
+
+    这是 calibrate_kappa.py 里 `R_base_imu = from_two_vectors(avg_accel, [0,0,1])`、
+    `(R_base_imu @ (gyro - b_g).T).T` 的纯函数版本。零偏 b_g、对齐旋转 R_base_imu 均由
+    **数据**(启动静止窗)估出,不是手设。sim(/sim/imu,base z-up)上 R≈I、b_g≈0,
+    故 imu_g_base[:,2] 应 ≈ gyro_z(也 ≈ gt_wz),imu_a_base ≈ [0,0,+g]。
+
+    accel/gyro (N,3) 安装系;t (N,) IMU 时戳;speed (M,K) 各轮速(注意:speed 的时间基
+    用于判静止窗,需与 IMU 同一段;调用方传 IMU 时戳上插值后的轮速,或 wheel 时序——
+    本函数只用 (t,speed) 做静止窗掩码,二者长度须一致)。
+
+    返回 (g_base(N,3), a_base(N,3), R_base_imu(3,3), b_g(3,), found_static(bool))。
+    """
+    accel = np.asarray(accel, float); gyro = np.asarray(gyro, float)
+    mask, found = static_window_mask(t, speed, static_sec, speed_eps)
+    b_g = gyro[mask].mean(axis=0)
+    avg_a = accel[mask].mean(axis=0)
+    R = from_two_vectors(avg_a, np.array([0.0, 0.0, 1.0]))
+    g_base = (R @ (gyro - b_g).T).T
+    a_base = (R @ accel.T).T
+    return g_base, a_base, R, b_g, found
+
+
 def static_window_mask(t, speed, static_sec=2.0, speed_eps=0.05):
     """选取启动静止窗的布尔掩码(对齐到 t / speed 的同一长度时序)。
 

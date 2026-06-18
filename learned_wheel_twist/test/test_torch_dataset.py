@@ -7,7 +7,9 @@ def _mk(td, name, n=80, kappa=0.005):
     np.savez(os.path.join(td, name), t_wheel=np.arange(n)*0.02,
              steer=rng.normal(0, 0.1, (n, 4)), speed=rng.uniform(0.2, 1.0, (n, 4)),
              gt_vx=rng.normal(0.5, 0.1, n), gt_vy=np.zeros(n), gt_wz=rng.normal(0, 0.1, n),
-             imu_yawrate=rng.normal(0, 0.1, (n, 1)), kappa_theory=kappa)
+             imu_yawrate=rng.normal(0, 0.1, (n, 1)),
+             imu_g_base=rng.normal(0, 0.1, (n, 3)), imu_a_base=rng.normal(0, 0.1, (n, 3)),
+             kappa_theory=kappa)
 
 def test_dataset_item_shapes():
     with tempfile.TemporaryDirectory() as td:
@@ -63,6 +65,40 @@ def test_dataset_imu_wz_prior_requires_imu():
         _, _, ls = ds[i]
         ls_ref = ls_twist(d["steer"][i+24], d["speed"][i+24])
         np.testing.assert_allclose(ls[2].item(), ls_ref[2], rtol=1e-5)  # 仍是 LS wz
+
+
+def test_dataset_data_driven_14ch():
+    # phase-3: data_driven → 14 通道(steer4+speed4+imu_g_base3+imu_a_base3),ls_prior=0。
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=True, data_driven=True)
+        x, y, ls = ds[0]
+        assert x.shape == (14, 25)
+        assert y.shape == (3,) and ls.shape == (3,)
+        np.testing.assert_allclose(ls.numpy(), 0.0, atol=1e-12)   # 无 LS 先验
+
+
+def test_data_driven_features_match_npz():
+    # data_driven 通道顺序须为 steer4|speed4|imu_g_base3|imu_a_base3(未标准化时可对照原始)。
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=False, data_driven=True)
+        d = np.load(os.path.join(td, "e.npz"))
+        x, _, _ = ds[0]   # (14,25),窗 = 帧 0..24
+        xw = x.numpy().T   # (25,14)
+        np.testing.assert_allclose(xw[:, 8:11], d["imu_g_base"][:25], rtol=1e-5)
+        np.testing.assert_allclose(xw[:, 11:14], d["imu_a_base"][:25], rtol=1e-5)
+
+
+def test_data_driven_overrides_imu_wz_prior():
+    # data_driven 与 imu_wz_prior 互斥:data_driven 优先,ls 仍为 0。
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=False,
+                          data_driven=True, with_imu=True, imu_wz_prior=True)
+        assert not ds.imu_wz_prior
+        _, _, ls = ds[0]
+        np.testing.assert_allclose(ls.numpy(), 0.0, atol=1e-12)
 
 
 def test_dataset_no_aug_deterministic():
