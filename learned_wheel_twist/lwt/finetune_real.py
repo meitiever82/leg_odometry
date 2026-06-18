@@ -38,11 +38,15 @@ def make_real_segments(npz_path, norm, window, dd, wza, segment_sec, stride_sec,
     """真机 npz → 连续 L 秒分段(无 gt twist)。每段:
       X (S,C,window) 标准化后的逐窗输入(C×T 排布,模型可直接 roll)
       t (S,)         窗末时戳(float64,绝对 epoch;用于激光插值 + 积分)
+      yr (S,)        窗末 imu_yawrate(未标准化;wz_anchor 先验 = [0,0,yr];free-wz 忽略)
     监督来自激光,故不需要 G。"""
     d = np.load(npz_path)
     F = build_features(d, with_imu=(not dd and not wza and False),
                        data_driven=dd, wz_anchor=wza).astype(np.float32)   # (N,C)
     t = np.asarray(d["t_wheel"], float).reshape(-1)
+    keys = d.files if hasattr(d, "files") else d
+    yawrate = (np.asarray(d["imu_yawrate"]).reshape(-1).astype(np.float32)
+               if "imu_yawrate" in keys else np.zeros(len(F), np.float32))  # 去偏陀螺 base yaw-rate
     N = len(F)
     S = int(round(segment_sec * hz))
     stride = max(1, int(round(stride_sec * hz)))
@@ -54,7 +58,7 @@ def make_real_segments(npz_path, norm, window, dd, wza, segment_sec, stride_sec,
         if norm is not None:
             Xseg = (Xseg - norm[0]) / norm[1]
         x = np.transpose(Xseg, (0, 2, 1)).copy()                          # (S,C,window)
-        segs.append((torch.from_numpy(x).float(), t[idx].copy()))
+        segs.append((torch.from_numpy(x).float(), t[idx].copy(), yawrate[idx].copy()))
     return segs
 
 
@@ -91,13 +95,13 @@ def main():
           f"l2_anchor={ft['l2_anchor']} seg={ft['segment_sec']}s/stride{ft['stride_sec']}s")
 
     # 训练段:2 个 bag 的激光监督段。
-    train_segs = []   # list of (x(S,C,W), wt(S,), tum(N,8))
+    train_segs = []   # list of (x(S,C,W), wt(S,), yr(S,), tum(N,8), bag)
     for bag in fold["train"]:
         npz, tum_path = REAL_BAGS[bag]
         T = np.loadtxt(tum_path)
         segs = make_real_segments(npz, norm, W, dd, wza, ft["segment_sec"], ft["stride_sec"], hz)
-        for x, wt in segs:
-            train_segs.append((x, wt, T, bag))
+        for x, wt, yr in segs:
+            train_segs.append((x, wt, yr, T, bag))
     print(f"  train segments={len(train_segs)} (across {len(fold['train'])} bags)")
 
     opt = torch.optim.Adam(m.parameters(), lr=lr)
@@ -119,10 +123,17 @@ def main():
             opt.zero_grad()
             traj_loss_acc = 0.0
             for j in bidx:
-                x, wt, T, _bag = train_segs[j]
+                x, wt, yr, T, _bag = train_segs[j]
                 x = x.to(dev)                              # (S,C,W)
                 S = x.shape[0]
-                tw, _ = m(x, ls_zero.expand(S, 3))         # (S,3) twist
+                # wz_anchor:先验 = [0,0,imu_yawrate(窗末)],twist = 先验 + 残差,
+                # 激光只教 vx/vy 头 + wz 残差(陀螺锚保留)。free-wz(prior='none')忽略先验。
+                if wza:
+                    lsp = torch.zeros(S, 3, device=dev)
+                    lsp[:, 2] = torch.as_tensor(yr, device=dev)
+                else:
+                    lsp = ls_zero.expand(S, 3)
+                tw, _ = m(x, lsp)                          # (S,3) twist
                 wt_t = torch.as_tensor(wt, dtype=torch.float64, device=dev)
                 tl = lidar_traj_loss(tw, wt_t, T, strides=strides, yaw_weight=yaw_w, disp_weight=disp_w)
                 traj_loss_acc = traj_loss_acc + tl

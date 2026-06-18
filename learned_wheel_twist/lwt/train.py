@@ -238,9 +238,18 @@ def main():
     print(f"episodes train/val/test = {len(tr)}/{len(va)}/{len(te)}")
     W = cfg["data"]["window"]; ka = cfg["kappa_aug"]
     in_ch = 14 if (data_driven or wz_anchor) else (9 if with_imu else 8)   # phase-3/4: 8 wheel + 6 base IMU
+    # 阶段七 Step 1:wz-anchor 预训练同样支持 --wheel-noise(仅轮速通道,IMU 不动);
+    # 给真机激光 fine-tune 准备鲁棒的 vx/vy 轮速尺度,而陀螺保持可信 wz 锚源。与 κ-aug 正交。
+    wheel_noise = cfg.get("pretrain", {}).get("wheel_noise_std") if getattr(a, "wheel_noise", False) else None
+    if wheel_noise and wheel_noise.get("enable"):
+        print(f"[阶段七 Step1 wheel-noise] 仅轮速通道:speed_std={wheel_noise['speed_std']} m/s, "
+              f"steer_std={wheel_noise['steer_std_deg']}° (IMU 通道不加噪)")
+    else:
+        wheel_noise = None
     dtr = TwistDataset([p for p, _ in tr], W, augment=True, with_imu=with_imu,
                        steer_bias_max_deg=ka["steer_bias_max_deg"], speed_scale_std=ka["speed_scale_std"],
-                       imu_wz_prior=imu_wz_prior, data_driven=data_driven, wz_anchor=wz_anchor)
+                       imu_wz_prior=imu_wz_prior, data_driven=data_driven, wz_anchor=wz_anchor,
+                       wheel_noise=wheel_noise)
     norm = dtr.fit_norm()
     dva = TwistDataset([p for p, _ in va], W, augment=False, with_imu=with_imu, norm=norm,
                        imu_wz_prior=imu_wz_prior, data_driven=data_driven, wz_anchor=wz_anchor)
