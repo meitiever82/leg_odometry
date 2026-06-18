@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 from lwt.kinematics import ls_twist
+from lwt.realism import RealismAug
 
 def build_features(d, with_imu=False, data_driven=False, wz_anchor=False):
     """从 .npz 字典构造逐帧特征矩阵 F (N,C),通道布局:
@@ -112,8 +113,13 @@ class SegmentDataset(torch.utils.data.Dataset):
       yr_seg (S,)            窗末 imu_yawrate
     norm 复用 per-frame 训练集统计(同模型同输入分布)。data_driven 模式 14ch。"""
     def __init__(self, npz_paths, window=25, segment_sec=10.0, wheel_hz=50,
-                 norm=None, data_driven=True, stride_sec=None):
+                 norm=None, data_driven=True, stride_sec=None, realism=None, seed=0):
         self.window, self.norm = window, norm
+        # approach-2 step2a: sim 保真增广(仅 data_driven 14ch)。per-segment 抽一组常值
+        # κ-bias / 陀螺残差偏置(模拟该 episode 固定标定/对齐状态),保证轨迹损失看到一致偏置;
+        # 白噪声/bumps 仍逐输出帧窗随机施加。realism=None 或 enable=False 则不增广。
+        self.realism = (realism if (realism and realism.get("enable") and data_driven) else None)
+        self.rng = np.random.default_rng(seed)
         self.segs = []
         for p in npz_paths:
             self.segs += make_segments(p, window, segment_sec, wheel_hz,
@@ -122,9 +128,38 @@ class SegmentDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.segs)
 
+    def _augment_segment(self, X):
+        """对一段 (S,window,C) 施加 realism:per-segment 常值 κ-bias + 陀螺残差偏置(标定/对齐状态),
+        per-window 随机白噪声 + bumps。bumps 逐输出帧窗独立(瞬态不需跨窗一致)。"""
+        from lwt.realism import (apply_kappa_bulk, apply_gyro_realism,
+                                 apply_speed_bumps, apply_accel_noise, G0)
+        c = self.realism
+        kb, gy, bp, an = (c.get("kappa_bulk", {}), c.get("gyro", {}),
+                          c.get("bumps", {}), c.get("accel_noise", {}))
+        # --- per-segment 常值:κ-bias(左右轮速差分)+ 陀螺三轴残差偏置 ---
+        if kb.get("enable"):
+            apply_kappa_bulk(X.reshape(-1, X.shape[-1]), True, kb.get("kappa_std", 0.04), self.rng)
+        if gy.get("enable") and gy.get("sigma_bias", 0.0) > 0:
+            b = self.rng.normal(0.0, gy["sigma_bias"], 3).astype(X.dtype)
+            X[:, :, G0:G0 + 3] += b[None, None, :]
+        # --- per-window:bumps → 陀螺白噪声 → 加速度白噪声 ---
+        for j in range(X.shape[0]):
+            w = X[j]
+            apply_speed_bumps(w, enable=bp.get("enable", False), event_rate=bp.get("event_rate", 0.03),
+                              speed_blip=bp.get("speed_blip", 0.05), accel_z=bp.get("accel_z", 2.0),
+                              pitchroll_rate=bp.get("pitchroll_rate", 0.05),
+                              event_len_min=bp.get("event_len_min", 3),
+                              event_len_max=bp.get("event_len_max", 10), rng=self.rng)
+            apply_gyro_realism(w, enable=gy.get("enable", False), sigma_bias=0.0,
+                               sigma_noise=gy.get("sigma_noise", 0.005), rng=self.rng)
+            apply_accel_noise(w, enable=an.get("enable", False), sigma=an.get("sigma", 0.05), rng=self.rng)
+        return X
+
     def __getitem__(self, i):
         s = self.segs[i]
         X = s["X"].copy()                              # (S,window,C)
+        if self.realism is not None:
+            X = self._augment_segment(X)
         if self.norm is not None:
             X = (X - self.norm[0]) / self.norm[1]
         x = torch.from_numpy(np.transpose(X, (0, 2, 1)).copy()).float()  # (S,C,window)
@@ -137,8 +172,11 @@ class TwistDataset(torch.utils.data.Dataset):
     增广在 __getitem__ 内对原始窗逐样本随机施加(每次不同),真值 y 不变。"""
     def __init__(self, npz_paths, window=25, augment=False, with_imu=False,
                  steer_bias_max_deg=1.0, speed_scale_std=0.015, norm=None, seed=0,
-                 imu_wz_prior=False, data_driven=False, wz_anchor=False):
+                 imu_wz_prior=False, data_driven=False, wz_anchor=False, realism=None):
         self.window, self.augment, self.with_imu = window, augment, with_imu
+        # approach-2 step2a: 仅 data_driven 14ch 启用 sim 保真增广(取代 κ-aug,因 κ-bulk 已含轮速尺度)。
+        self._realism = RealismAug(realism, np.random.default_rng(seed + 7)) \
+            if (realism and realism.get("enable") and data_driven) else None
         # phase-4: wz_anchor → 14ch(同 data_driven 特征),但先验=[0,0,imu_yawrate(窗末)]。
         # vx/vy 从 raw 学(先验 0),wz=去偏陀螺+残差。与 data_driven 互斥(若同传以 data_driven 优先)。
         self.wz_anchor = wz_anchor and not data_driven
@@ -166,7 +204,10 @@ class TwistDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         w = self.X[i].copy()
-        if self.augment:
+        if self._realism is not None:
+            # sim 保真增广(含 κ-bulk 轮速尺度);取代旧 κ-aug。标签 Y 不变。
+            w = self._realism(w)
+        elif self.augment:
             w = augment_kappa(w, self.sbm, self.sss, self.rng)
         if self.wz_anchor:
             # phase-4 wz_anchor:先验 = [0, 0, imu_yawrate(窗末,未标准化)]。

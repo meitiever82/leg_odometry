@@ -21,3 +21,25 @@ traj:
   lambda_pf: 2.0           # 逐帧 twist MSE 正则强度(锚 vx/vy/wz 尺度,防退化/不稳)
   pf_warmup_epochs: 12     # 前 N 轮仅逐帧 MSE 预热,之后启用轨迹损失
   traj_lr_scale: 0.3       # 轨迹损失阶段学习率缩放(rollout 梯度噪声大,降 LR 稳)
+# approach-2 step2a:sim 保真增广(--realism 时生效)。把真机域退化注入 SIM 训练输入(仅 14ch data-driven,
+# 标签不变)。幅值为真机缓存实测估计(见 lwt/realism.py 注释 + test_report 阶段五-b)。
+realism:
+  enable: true             # 总开关;--realism 时 train.py 覆盖为 true
+  kappa_bulk:              # κ-bulk:把真机 |κ|≈0.04 放到 effective-κ 分布中位(取代旧 κ-aug 尾部)
+    enable: true
+    kappa_std: 0.04        # per-window 目标 κ ~ N(0, std);real per-session κ −0.035..−0.044
+  gyro:                    # 真实陀螺:打破 "sim 陀螺=完美 gt_wz"(实测 sim std 8e-4)
+    enable: true
+    sigma_bias: 0.003      # per-window 残差偏置(去偏后残留,real wz DC ~−0.006)
+    sigma_noise: 0.005     # per-sample 白噪声(real yaw 高频 diff-std ~0.017→σ≈0.005,三轴同)
+  bumps:                   # 合成减速带/颠簸:~3% 帧聚成短事件
+    enable: true
+    event_rate: 0.03       # 命中事件帧占比(real |az-mean|>3σ ~1.1−1.3%,放宽到 3% 覆盖更软的颠簸)
+    speed_blip: 0.05       # 轮速 bounce/slip 相对量级
+    accel_z: 2.0           # 垂直加速度尖峰(m/s²;real az std 1.0−2.2)
+    pitchroll_rate: 0.05   # pitch/roll 角速率尖峰(rad/s;real g_base 轴0/1 std 0.02−0.10)
+    event_len_min: 3       # 事件最短帧(@50Hz = 60ms)
+    event_len_max: 10      # 事件最长帧(@50Hz = 200ms)
+  accel_noise:             # 加速度小白噪声(避免 accel 不真实地干净)
+    enable: true
+    sigma: 0.05

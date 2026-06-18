@@ -76,16 +76,25 @@ def train_traj(cfg, a):
     print(f"episodes train/val/test = {len(tr)}/{len(va)}/{len(te)}")
     W = cfg["data"]["window"]; hz = cfg["data"]["wheel_hz"]; ka = cfg["kappa_aug"]
     in_ch = 14
+    # approach-2 step2a: sim 保真增广(--realism)。同时作用于逐帧锚集 + 分段轨迹集(仅 SIM 训练输入)。
+    realism = cfg.get("realism") if getattr(a, "realism", False) else None
+    if realism:
+        rb = realism
+        print(f"[approach-2 step2a realism] κ-bulk(std={rb['kappa_bulk']['kappa_std']}) "
+              f"gyro(σb={rb['gyro']['sigma_bias']},σn={rb['gyro']['sigma_noise']}) "
+              f"bumps(rate={rb['bumps']['event_rate']}) accel(σ={rb['accel_noise']['sigma']})")
     # 逐帧训练集:用于 fit_norm + 逐帧 NLL 正则 + per-frame std 权重。复用既有 data_driven 路径。
+    # 注意:norm 在 fit_norm() 里用 **未增广** 的 self.X 统计(增广在 __getitem__),故 norm 仍是干净 sim 分布。
     dtr_pf = TwistDataset([p for p, _ in tr], W, augment=True, with_imu=False,
                           steer_bias_max_deg=ka["steer_bias_max_deg"], speed_scale_std=ka["speed_scale_std"],
-                          data_driven=True)
+                          data_driven=True, realism=realism)
     norm = dtr_pf.fit_norm()
     ystd = dtr_pf.Y.std(0) + 1e-6; w = torch.tensor(1.0/ystd, dtype=torch.float32, device=dev)
     Lpf = torch.utils.data.DataLoader(dtr_pf, batch_size=cfg["train"]["batch"], shuffle=True, num_workers=4)
     # 分段训练集(轨迹损失)。norm 复用逐帧统计。
     seg_tr = SegmentDataset([p for p, _ in tr], W, tj["segment_sec"], hz, norm=norm,
-                            data_driven=True, stride_sec=tj["stride_sec"])
+                            data_driven=True, stride_sec=tj["stride_sec"], realism=realism)
+    # 验证段保持干净 sim(不增广)——val 是 in-distribution sim 门槛的口径基准。
     seg_va = SegmentDataset([p for p, _ in va], W, tj["segment_sec"], hz, norm=norm,
                             data_driven=True, stride_sec=tj["segment_sec"])
     print(f"train segments={len(seg_tr)} val segments={len(seg_va)} (S={int(round(tj['segment_sec']*hz))} frames/seg)")
@@ -187,6 +196,9 @@ def main():
     ap.add_argument("--traj-loss", action="store_true",
                     help="approach-2 step1: 端到端可微长程轨迹损失(data-driven 14ch,prior='none')。"
                          "对连续 L 秒分段 roll 模型→积分→RPE 轨迹损失,使积分航向漂移可见。")
+    ap.add_argument("--realism", action="store_true",
+                    help="approach-2 step2a: sim 保真增广(κ-bulk + 真实陀螺噪声/残差偏置 + 合成颠簸 + 加速度噪声),"
+                         "把真机域退化注入 SIM 训练输入闭合 sim→real gap(仅配 --traj-loss;标签不变)。")
     ap.add_argument("--epochs", type=int, default=cfg["train"]["epochs"])
     ap.add_argument("--out", default="learned_wheel_twist/runs/lwt_wheel")
     a = ap.parse_args()
