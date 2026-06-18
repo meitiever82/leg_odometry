@@ -36,3 +36,21 @@ def test_data_driven_zero_init_disabled():
     # prior='none' 下 zero_init_residual 不应把 head 清零(否则输出恒 0,学不动)。
     m = TwistTCN(in_ch=14, channels=48, layers=4, kernel=3, prior="none", zero_init_residual=True)
     assert not torch.allclose(m.head_delta.weight, torch.zeros_like(m.head_delta.weight))
+
+
+def test_wz_anchor_zero_residual_equals_prior():
+    # phase-4: prior='wz_anchor' + zero_init → 初始残差 0,twist 须恒等于先验 [0,0,gyro]。
+    m = TwistTCN(in_ch=14, channels=48, layers=4, kernel=3, prior="wz_anchor",
+                 zero_init_residual=True); m.eval()
+    x = torch.randn(4, 14, 25)
+    prior = torch.zeros(4, 3); prior[:, 2] = torch.tensor([0.1, -0.2, 0.05, 0.0])  # [0,0,gyro]
+    twist, _ = m(x, prior)
+    assert torch.allclose(twist, prior, atol=1e-5)   # 残差 0 → twist == 先验
+
+
+def test_wz_anchor_zero_init_applied():
+    # wz_anchor 是 non-"none" prior,zero_init_residual 须把 head_delta 清零。
+    m = TwistTCN(in_ch=14, channels=48, layers=4, kernel=3, prior="wz_anchor",
+                 zero_init_residual=True)
+    assert torch.allclose(m.head_delta.weight, torch.zeros_like(m.head_delta.weight))
+    assert torch.allclose(m.head_delta.bias, torch.zeros_like(m.head_delta.bias))

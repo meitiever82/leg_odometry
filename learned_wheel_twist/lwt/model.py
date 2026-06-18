@@ -20,6 +20,9 @@ class TwistTCN(nn.Module):
     - prior in {ls, imu_wz}(phase-1/2):twist = ls_prior + Δ(head),残差学在解析先验之上。
     - prior == none(phase-3 data-driven):twist = head(features),**直接回归**,不加任何
       LS/运动学先验(ls_prior 被忽略,等价 prior=0)。网络须自己从数据学出 轮速→twist 的几何。
+    - prior == wz_anchor(phase-4):14ch raw 特征(同 data-driven),但 ls_prior=[0,0,imu_yawrate(窗末)]。
+      twist = ls_prior + Δ(head),配 zero_init_residual:初始 vx=vy=0、wz=陀螺;
+      vx/vy 从 raw 学(先验 0),wz=去偏陀螺+小残差。是 non-"none" prior,走 ls_prior+out 分支。
 
     输入 x (B,in_ch,T);ls_prior (B,3) 仅在 prior!=none 时使用(none 模式下可传 0)。
     输出 twist (B,3),logvar (B,3)。

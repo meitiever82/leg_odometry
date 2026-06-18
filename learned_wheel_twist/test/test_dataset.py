@@ -12,14 +12,15 @@ def _fake_npz(path, n=200, kappa=0.005):
 def test_make_windows_shapes():
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "e.npz"); _fake_npz(p, n=100)
-        X, Y = make_windows(p, window=25)
+        X, Y, YR = make_windows(p, window=25)
         assert X.shape[0] == 100 - 25 + 1 and X.shape[1:] == (25, 8)
         assert Y.shape == (X.shape[0], 3)
+        assert YR.shape == (X.shape[0],)
 
 def test_make_windows_label_is_window_end():
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "e.npz"); _fake_npz(p, n=50)
-        d = np.load(p); X, Y = make_windows(p, window=25)
+        d = np.load(p); X, Y, YR = make_windows(p, window=25)
         np.testing.assert_allclose(Y[0], [d["gt_vx"][24], d["gt_vy"][24], d["gt_wz"][24]])
 
 def test_stratified_split_by_episode():

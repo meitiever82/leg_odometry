@@ -9,10 +9,10 @@ from lwt.dataset import TwistDataset
 from lwt.model import TwistTCN
 from lwt.kinematics import ls_twist, integrate_twist, ape_percent, rpe_segment
 
-def eval_episode(npz, m, norm, in_ch, W, dev, imu_wz_prior=False, data_driven=False):
+def eval_episode(npz, m, norm, in_ch, W, dev, imu_wz_prior=False, data_driven=False, wz_anchor=False):
     d = np.load(npz); t = d["t_wheel"]
     ds = TwistDataset([npz], W, augment=False, with_imu=(in_ch == 9), norm=norm,
-                      imu_wz_prior=imu_wz_prior, data_driven=data_driven)
+                      imu_wz_prior=imu_wz_prior, data_driven=data_driven, wz_anchor=wz_anchor)
     tw_gt = np.stack([d["gt_vx"], d["gt_vy"], d["gt_wz"]], 1)[W-1:]
     tt = t[W-1:]
     ls = ls_twist(d["steer"][W-1:], d["speed"][W-1:])
@@ -41,9 +41,11 @@ def main():
     W = ck["cfg"]["data"]["window"]
     iwp = ck["cfg"]["model"].get("imu_wz_prior", False)
     dd = ck["cfg"]["model"].get("data_driven", False)
+    wza = ck["cfg"]["model"].get("wz_anchor", False)
     if iwp: print("  [imu_wz_prior] 残差先验 wz = imu_yawrate")
     if dd: print("  [data-driven] prior='none' 直接回归(14ch raw 轮速+base IMU,无 LS 先验)")
-    rows = [eval_episode(p, m, ck["norm"], ck["in_ch"], W, dev, iwp, dd) for p, _ in ck["split"]["test"]]
+    if wza: print("  [wz-anchor] 先验=[0,0,imu_yawrate],wz=陀螺+残差,vx/vy 从 raw 学(14ch,无 LS)")
+    rows = [eval_episode(p, m, ck["norm"], ck["in_ch"], W, dev, iwp, dd, wza) for p, _ in ck["split"]["test"]]
     agg = lambda k: np.mean([r[k] for r in rows], 0)
     print("=== 仿真测集(%d ep)===" % len(rows))
     print(f"  twist RMSE   LS  vx/vy/wz = {agg('rmse_ls')}")

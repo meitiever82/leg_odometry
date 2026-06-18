@@ -101,6 +101,43 @@ def test_data_driven_overrides_imu_wz_prior():
         np.testing.assert_allclose(ls.numpy(), 0.0, atol=1e-12)
 
 
+def test_dataset_wz_anchor_prior():
+    # phase-4: wz_anchor → 14ch(同 data_driven 特征),先验=[0,0,imu_yawrate(窗末)]。
+    # vx/vy 先验须为 0,wz 先验须等于窗末 imu_yawrate(未标准化)。
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=False, wz_anchor=True)
+        d = np.load(os.path.join(td, "e.npz"))
+        i = 7
+        x, y, ls = ds[i]
+        assert x.shape == (14, 25)
+        w_end = i + 25 - 1
+        assert ls[0].item() == 0.0 and ls[1].item() == 0.0       # vx/vy 先验 0(从 raw 学)
+        np.testing.assert_allclose(ls[2].item(), d["imu_yawrate"][w_end, 0], rtol=1e-5)  # wz=窗末陀螺
+
+
+def test_dataset_wz_anchor_features_same_as_data_driven():
+    # wz_anchor 通道布局须与 data_driven 完全一致(steer4|speed4|imu_g_base3|imu_a_base3)。
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        d = np.load(os.path.join(td, "e.npz"))
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=False, wz_anchor=True)
+        x, _, _ = ds[0]; xw = x.numpy().T   # (25,14)
+        np.testing.assert_allclose(xw[:, 8:11], d["imu_g_base"][:25], rtol=1e-5)
+        np.testing.assert_allclose(xw[:, 11:14], d["imu_a_base"][:25], rtol=1e-5)
+
+
+def test_dataset_data_driven_overrides_wz_anchor():
+    # 若 data_driven 与 wz_anchor 同传,data_driven 优先,先验回到全 0。
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "e.npz")
+        ds = TwistDataset([os.path.join(td, "e.npz")], window=25, augment=False,
+                          data_driven=True, wz_anchor=True)
+        assert not ds.wz_anchor and ds.data_driven
+        _, _, ls = ds[0]
+        np.testing.assert_allclose(ls.numpy(), 0.0, atol=1e-12)
+
+
 def test_dataset_no_aug_deterministic():
     with tempfile.TemporaryDirectory() as td:
         _mk(td, "e.npz")
