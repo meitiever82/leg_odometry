@@ -43,3 +43,52 @@ def project_yawrate(accel, gyro, sign=1.0):
     else:
         up = g / n
     return sign * (gyro @ up)
+
+
+def static_window_mask(t, speed, static_sec=2.0, speed_eps=0.05):
+    """选取启动静止窗的布尔掩码(对齐到 t / speed 的同一长度时序)。
+
+    迭代e(2026-06-18)修复:`imu_yawrate` 通道是重力投影后的 yaw-rate,但**未扣除陀螺零偏**;
+    真机零偏投影到该轴 ~0.019 rad/s(≈1°/s),积分成跑飞的航向漂移。经典 wheel_odometry
+    (calibrate_kappa.py)用静止窗均值 b_g 扣零偏;由 `imu_yawrate = up·gyro` 的线性关系,
+    本通道的零偏 = up·b_g = **通道自身在静止窗的均值**,故只需对通道做静止窗去偏,无需原始陀螺。
+
+    t (N,) 时戳(s),speed (N,K) 各轮速(m/s)。返回 (N,) bool。
+    规则:优先取「前 static_sec 秒」;若该窗非静止(mean|speed|≥speed_eps),
+    则沿时间滑动,找最早一个时长≈static_sec 且 mean|speed|<speed_eps 的窗;
+    若全程都找不到,回退到「前 static_sec 秒」(由调用方记录 warning)。
+    """
+    t = np.asarray(t, float)
+    speed = np.asarray(speed, float)
+    spd = np.abs(speed)
+    spd_mag = spd.max(axis=1) if spd.ndim == 2 else spd
+    t0 = t[0]
+    first = t < t0 + static_sec
+    if first.sum() >= 1 and spd_mag[first].mean() < speed_eps:
+        return first, True
+    # 滑窗找最早静止段:以每个起点 i 取 [t_i, t_i+static_sec)。
+    for i in range(len(t)):
+        win = (t >= t[i]) & (t < t[i] + static_sec)
+        if win.sum() < 1:
+            continue
+        # 只接受真正覆盖了 ~static_sec 的窗(末点已到 / 数据用尽时长够)。
+        if t[win][-1] - t[win][0] < static_sec * 0.5:
+            continue
+        if spd_mag[win].mean() < speed_eps:
+            return win, True
+    return first, False  # 回退:前 static_sec 秒,found=False(调用方告警)
+
+
+def debias_yawrate(yawrate, t, speed, static_sec=2.0, speed_eps=0.05):
+    """对重力投影 yaw-rate 通道做启动静止窗去偏(扣陀螺零偏在该轴的投影)。
+
+    yawrate (N,) 或 (N,1);t (N,) 时戳;speed (N,K) 各轮速。
+    返回 (debiased_yawrate(同输入形状), bias(float), found_static(bool))。
+    bias = 静止窗内 yawrate 均值;debiased = yawrate - bias。
+    """
+    yawrate = np.asarray(yawrate, float)
+    flat = yawrate.reshape(-1)
+    mask, found = static_window_mask(t, speed, static_sec, speed_eps)
+    bias = float(flat[mask].mean())
+    out = (flat - bias).reshape(yawrate.shape)
+    return out, bias, found

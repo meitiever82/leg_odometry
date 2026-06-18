@@ -13,7 +13,7 @@ from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import JointState, Imu
 from nav_msgs.msg import Odometry
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lwt.imu_yawrate import project_yawrate
+from lwt.imu_yawrate import project_yawrate, debias_yawrate
 
 WHEEL_KEYS = ("front_left", "front_right", "rear_left", "rear_right")
 IMU_TOPICS = ("/sim/imu", "/rslidar_imu_data")
@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--storage", default="mcap"); ap.add_argument("--no-gt", action="store_true")
     ap.add_argument("--imu-topic", default=None, help="覆盖 IMU 话题;默认自动探测 /sim/imu→/rslidar_imu_data")
     ap.add_argument("--imu-sign", type=float, default=1.0, help="yaw_rate 全局符号(+1 sim,real 常为 -1,见 verify)")
+    ap.add_argument("--static-sec", type=float, default=2.0, help="启动静止窗时长(s),用于去陀螺零偏(迭代e)")
+    ap.add_argument("--speed-eps", type=float, default=0.05, help="判静止的最大 mean|轮速|(m/s)")
     a = ap.parse_args()
     ep = Path(a.episode_dir).expanduser()
     bag = ep/"rosbag2" if (ep/"rosbag2").exists() else ep
@@ -72,14 +74,23 @@ def main():
         d["imu_a"] = np.stack([np.interp(wt, it, ia[:, k]) for k in range(3)], 1)
         # phase-2 yaw-rate 通道:在 IMU 原始时戳上做重力投影,再对齐到 t_wheel。
         yr = project_yawrate(ia, ig, sign=a.imu_sign)        # (N_imu,)
-        d["imu_yawrate"] = np.interp(wt, it, yr)[:, None].astype(np.float64)  # (N_wheel,1)
+        yr_wheel = np.interp(wt, it, yr)[:, None].astype(np.float64)  # (N_wheel,1)
+        # 迭代e:扣陀螺零偏(静止窗内通道均值)——经典 wheel_odometry 一直在做,phase-2 漏了,
+        # 导致真机 ~0.019 rad/s 偏置积分成跑飞航向漂移。等价于扣 up·b_g(见 imu_yawrate.debias_yawrate)。
+        yr_db, bias, found = debias_yawrate(yr_wheel, wt, wv, a.static_sec, a.speed_eps)
+        if not found:
+            print(f"WARN 未找到 mean|轮速|<{a.speed_eps} 的静止窗,回退用前 {a.static_sec}s 估零偏 "
+                  f"(可能高估零偏);bias={bias:+.5f} rad/s")
+        d["imu_yawrate"] = yr_db
+        d["imu_yawrate_bias"] = np.float64(bias)  # 已扣除的零偏,供溯源
     pf = ep/"episode_params.yaml"
     if pf.exists():
         d["kappa_theory"] = float(yaml.safe_load(pf.read_text()).get("kappa_theory", np.nan))
     np.savez_compressed(a.out, **d)
+    bias_str = f"{float(d['imu_yawrate_bias']):+.5f}" if "imu_yawrate_bias" in d else "n/a"
     print(f"EXTRACT_OK {a.out} wheel={len(wt)} gt={'y' if 'gt_vx' in d else 'n'} "
           f"imu={'y' if 'imu_g' in d else 'n'} yawrate={'y' if 'imu_yawrate' in d else 'n'} "
-          f"topic={imu_topic} sign={a.imu_sign:+.0f}")
+          f"yawrate_bias={bias_str} topic={imu_topic} sign={a.imu_sign:+.0f}")
 
 if __name__ == "__main__":
     main()
