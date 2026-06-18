@@ -14,7 +14,7 @@ wheel_only_odom:
     # 2026-05-22-13_58_40: gyro yaw cut APE 10.96 -> 0.34 m vs GLIM.
     # Set false only for a bag with no IMU (then yaw is forced to LS, ~37%
     # under-estimated while driving — see project memory).
-    enable_imu:      false
+    enable_imu:      true
     bias_window_sec: 3.0
     tilt_kp:         1.0
     tilt_accel_band: 0.5
@@ -25,7 +25,7 @@ wheel_only_odom:
     # "gyro": ω_z from IMU after auto-mount calibration (requires enable_imu=true).
     #         Strongly preferred when an IMU is present — pure-wheel LS yaw is
     #         slip-limited (~0.69 net-ratio while driving); gyro gets ~0.99.
-    yaw_source:    "ls"
+    yaw_source:    "gyro"
     # Curvature-bias correction for the LS-yaw path: ω_z ← ω_z_LS − yaw_kappa·vx
     # (rad/m). Removes the speed-proportional steering/scale bias that otherwise
     # drifts pure-wheel yaw ~1.9°/s. ONLY used when yaw_source="ls" (enable_imu=
@@ -79,4 +79,4 @@ wheel_only_odom:
 
     # Empty string disables CSV logging — leave empty; live PNG is produced
     # by the trajectory_plotter node spawned from the launch file.
-    diag_csv_path: "/tmp/wheel_odom.csv"
+    diag_csv_path: "/tmp/traj_imu_wheel.txt"
